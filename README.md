@@ -1,149 +1,268 @@
 <p align="center"><img src="docs/assets/logo.svg" alt="" width="96" height="96"></p>
 
-# Hopsync
+<h1 align="center">Hopsync</h1>
 
-Fast, careful file transfer between SSH hosts: seedbox to seedbox, or any SSH box to any SSH box.
-Hopsync speaks plain SFTP, so the server needs only a standard OpenSSH account.
+<p align="center">
+  Fast file transfer between SSH servers, run from a web UI or the command line.<br>
+  One binary. The other side needs only a normal SSH account with SFTP.
+</p>
 
-**Status: Phases 0 to 3 done: transfer engine, daemon with job queue and JSON API, and the web
-UI.** Packaging and TLS are Phase 4. See [plan.md](plan.md). Nothing is released yet.
+<p align="center">
+  <a href="#performance">Performance</a> ·
+  <a href="#build-from-source">Build</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#security">Security</a> ·
+  <a href="#documentation">Documentation</a>
+</p>
 
-## What it does
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/screens/transfers-light.png">
+  <img src="docs/assets/screens/transfers-dark.png" alt="The Hopsync web UI: live upload and download speed at the top, this box and a seedbox side by side with differences highlighted, and two running jobs in the queue below.">
+</picture>
 
-- **Parallel lanes.** One transfer opens several SSH connections and splits big files into chunks
-  across them. That gets past the per-connection window limit that holds `scp` and `sftp` to a few
-  MB/s on long links. Lanes start at 4 and are added while each one still raises throughput.
-- **Resume.** Interrupted files continue from their last durable chunk, after a crash or `kill -9`
-  too.
-- **Safe by default.** Host keys are pinned, and a changed key is a hard failure. Existing files are
-  skipped unless you choose a policy. Data goes to `name.hopsync-part` and is renamed into place
-  only when complete.
-- **Light on the box.** Memory is bounded. The page cache is dropped after streaming, so a
-  seedbox's cache stays free for its own work. There are no temporary copies.
-- **Optional verify.** `--verify` reads every chunk back and compares xxh3-128 hashes before the
-  rename.
+> [!NOTE]
+> Hopsync is pre-release software. The transfer engine, daemon and web UI work and are tested, but
+> there are no release binaries yet and no independent security review. See
+> [Project status](#project-status).
 
-## Build
+## Why Hopsync
 
-Requires Rust (the version is pinned in `rust-toolchain.toml`) on Linux 5.6 or later.
+`scp` and `sftp` move one stream at a time. On a long link, the SSH window limits that stream to a
+few MB/s, and every small file costs several round trips. Hopsync runs on one box and pushes to or
+pulls from any other box over SSH, with no agent to install there:
+
+- **Parallel lanes.** One transfer opens several SSH connections and splits big files across them.
+  Lanes start at 4 and grow to 16 while each new lane still adds speed.
+- **Many small files at once.** Files stay in flight together, so the round-trip time is paid once
+  per batch instead of once per file.
+- **Resume after anything.** An interrupted file continues from its last durable chunk, even after
+  `kill -9`.
+- **Careful with your data.** Host keys are pinned, and a changed key stops the transfer. Existing
+  files are skipped unless you choose otherwise. Data goes to `name.hopsync-part` and is renamed
+  into place only when complete. `--verify` reads every chunk back and compares xxh3-128 hashes
+  before the rename.
+- **Light on the box.** Memory has a fixed limit that does not grow with file size. Page cache is
+  dropped after streaming, so a shared seedbox keeps its cache for its own work. There are no
+  temporary copies.
+
+## Performance
+
+Measured against OpenSSH `scp` and `sftp` on a shared seedbox about 200 ms away. Each tool used the
+same server, key and data, one after another.
+
+<img src="docs/assets/charts/real-link-big-file.svg" alt="Bar chart. Upload: hopsync 11.7, scp 5.9, sftp 6.1 MB/s. Download: hopsync 15.7, scp 7.9, sftp 7.5 MB/s." width="760">
+
+<img src="docs/assets/charts/real-link-small-files.svg" alt="Bar chart. Upload: hopsync 39, scp 249, sftp 188 seconds. Download: hopsync 31, scp 250, sftp 252 seconds." width="760">
+
+The speed has a cost. Parallel lanes use more memory than one stream on big files, up to a fixed
+limit set by the lane count and buffer sizes:
+
+<img src="docs/assets/charts/memory.svg" alt="Bar chart of peak client memory. Big file up: hopsync 40.7, scp 14.8, sftp 14.8 MiB. Big file down: hopsync 28.0, scp 14.2, sftp 14.4 MiB. Small files up: hopsync 10.5, scp 12.9, sftp 13.2 MiB." width="760">
+
+<details>
+<summary>Loopback charts and all numbers</summary>
+<br>
+
+Loopback uses tmpfs on both sides, so it measures CPU cost, not a disk or a network.
+
+<img src="docs/assets/charts/loopback-big-file.svg" alt="Bar chart. Upload: hopsync 734, scp 526, sftp 527 MB/s. Download: hopsync 1,057, scp 573, sftp 568 MB/s." width="760">
+
+<img src="docs/assets/charts/loopback-small-files.svg" alt="Bar chart. Upload: hopsync 0.30, scp 0.65, sftp 0.52 seconds. Download: hopsync 0.28, scp 0.67, sftp 0.66 seconds." width="760">
+
+| 200 ms link, median of 2 runs | hopsync | scp | sftp |
+|---|---:|---:|---:|
+| Upload one 256 MiB file | **11.7 MB/s** | 5.9 MB/s | 6.1 MB/s |
+| Download one 256 MiB file | **15.7 MB/s** | 7.9 MB/s | 7.5 MB/s |
+| Upload 300 small files | **39.0 s** | 249.0 s | 188.2 s |
+| Download 300 small files | **31.3 s** | 250.2 s | 251.5 s |
+| Peak memory, upload one big file | 40.7 MiB | 14.8 MiB | 14.8 MiB |
+| Peak memory, download one big file | 28.0 MiB | 14.2 MiB | 14.4 MiB |
+| Peak memory, upload small files | 10.5 MiB | 12.9 MiB | 13.2 MiB |
+
+| Loopback, median of 3 runs | hopsync | scp | sftp |
+|---|---:|---:|---:|
+| Upload one 512 MiB file | **734 MB/s** | 526 MB/s | 527 MB/s |
+| Download one 512 MiB file | **1,057 MB/s** | 573 MB/s | 568 MB/s |
+| Upload 2,000 small files | **0.30 s** | 0.65 s | 0.52 s |
+| Download 2,000 small files | **0.28 s** | 0.67 s | 0.66 s |
+
+</details>
+
+These results have limits:
+
+- The seedbox is shared, so other users' load varies between runs. Real-link results use only 2 runs
+  because one `scp` tree run takes over 4 minutes.
+- The real-link big-file runs last about 20 seconds, and that includes the time lanes take to ramp up.
+- `rsync`, `rclone` and `lftp` are not compared yet. Neither is a 1 Gbps link.
+
+[Method and caveats](docs/phase1/benchmarks.md) · [Medians as JSON](docs/benchmarks/results.json) ·
+[Benchmark script](benches/bench.py) · [Chart script](benches/charts.py)
+
+## Build from source
+
+You need these on the machine that builds:
+
+- Rust. `rust-toolchain.toml` pins the version.
+- Node.js 20.19 or later, or 22.12 or later, with [pnpm](https://pnpm.io). `packageManager` in
+  `package.json` pins the pnpm version.
 
 ```bash
-cargo build --release
+cd crates/hopsync/web
+pnpm install --frozen-lockfile
+pnpm build
+cd ../../..
+HOPSYNC_REQUIRE_UI=1 cargo build --release
 ```
 
-## Use
+The result is `target/release/hopsync`, about 20 MB, with the whole web UI compiled in. Copy that
+one file to your server. **The server does not need Node, npm or anything else from the build**, and
+the UI never loads anything from another site at runtime. Hopsync runs on Linux 5.6 or later.
 
-Pin the server's host key once. Compare the fingerprint with the one your provider shows, or pass
-it with `--fingerprint SHA256:...`:
+If you build without the UI, the binary still works and its web page tells you how to add the UI.
+`HOPSYNC_REQUIRE_UI=1` turns that case into a build error.
+
+## Quick start
+
+### Web UI
+
+Start the daemon on the box that will run transfers. `--root` is the only local folder it can touch.
 
 ```bash
-target/release/hopsync hosts trust seedbox.example.com
+hopsync serve --root ~/downloads
 ```
 
-Copy a file or a directory tree:
+The daemon listens on `127.0.0.1:7890`. To reach it on a remote box, forward the port over SSH:
 
 ```bash
-target/release/hopsync push -i ~/.ssh/id_ed25519 ./Movies user@seedbox.example.com:downloads/
+ssh -L 7890:127.0.0.1:7890 you@your-box
+```
+
+Open <http://127.0.0.1:7890/>. There is no default password. The daemon's log names a file holding a
+one-time setup token, and the page asks for that token once to set the admin password.
+
+Then add a server under **Servers**. Compare the host key fingerprint with the one your provider
+shows, and confirm it. Hopsync can create a key for that server and install it with the account
+password once, so no password is stored.
+
+On **Transfers** you browse both sides, compare them, select files and folders, and copy them either
+way. Before anything is queued, a preview shows what would be new, replaced or skipped. No question
+interrupts a running job. Jobs can be paused, resumed, cancelled, retried and reordered, and they
+survive a daemon restart. Each job has a page that lists every file and why it was skipped or failed.
+
+<p align="center"><img src="docs/assets/screens/transfers-phone.png" alt="The Hopsync web UI at phone width, with live speeds at the top and the panes stacked." width="280"></p>
+
+### Command line
+
+Pin the server's host key once:
+
+```bash
+hopsync hosts trust seedbox.example.com
+```
+
+Copy a file or a folder:
+
+```bash
+hopsync push -i ~/.ssh/id_ed25519 ./Images user@seedbox.example.com:downloads/
 ```
 
 ```bash
-target/release/hopsync pull user@seedbox.example.com:downloads/Show ./
+hopsync pull user@seedbox.example.com:downloads/Datasets ./
 ```
-
-Useful options (`hopsync push --help` lists them all):
 
 | Option | Effect |
 |---|---|
-| `--existing skip\|update\|overwrite\|rename` | What to do with files already at the destination. `update` replaces files whose size or mtime differ, but keeps ones that are newer at the destination. |
+| `--existing skip\|update\|overwrite\|rename` | What to do with files already at the destination. The default is `skip`. |
 | `--verify` | Read everything back and compare it before the rename. |
-| `-l N` / `--max-lanes N` | Fix the lane count, or cap the automatic one (default 4 rising to 16). |
+| `-l N` / `--max-lanes N` | Fix the lane count, or cap the automatic one. |
 | `--min-free 10G` | Refuse files that would leave less free space than this at the destination. |
-| `--cache keep` | Leave transferred data in the page cache (the default drops it). |
+| `--cache keep` | Keep transferred data in the page cache. The default drops it. |
 | `--no-resume` | Do not record or use the resume journal. |
 
-## Run it as a service
+`hopsync push --help` lists every option.
 
-`hopsync serve` runs the daemon: a job queue that survives restarts, a JSON API with live
-progress (Server-Sent Events), and a socket for the commands below. It listens on
-`127.0.0.1:7890` and keeps its data in `~/.local/share/hopsync`.
-
-```bash
-target/release/hopsync serve --root ~/downloads
-```
-
-Open `http://127.0.0.1:7890/` in a browser. On first start there is no password: the log names a
-file holding a one-time setup token, and the page asks for it once to set the admin password. The
-token is never written to the log. To reach a daemon on a remote box, forward the port over SSH
-(`ssh -L 7890:127.0.0.1:7890 box`) rather than listening on a public address.
-
-The web UI has two panes, this box and a server: browse both, compare them, select files and
-folders, and copy them either way. Before anything is queued it shows what would happen
-(new, replaced, skipped) for the policy you pick. Below the panes, the queue shows live progress,
-speed and time left; jobs can be paused, resumed, cancelled, retried and reordered, and each has a
-page listing every file and why it was skipped or failed.
-
-The same binary drives a running daemon over its socket, with no login (the socket only accepts
-your own user):
+The same binary also controls a running daemon over its local socket. Only your own user can use the
+socket, so it needs no login.
 
 ```bash
-target/release/hopsync servers
+hopsync servers
+hopsync queue push seedbox Images/debian Images/debian --dry-run
+hopsync jobs
+hopsync job pause 12
 ```
 
-```bash
-target/release/hopsync queue push seedbox Show/Season.1 Show/Season.1 --dry-run
-```
+### Run as a service
 
-```bash
-target/release/hopsync jobs
-```
-
-`hopsync job pause|resume|cancel|show|rm <id>` controls one job. A paused, failed or restarted job
-resumes from its journal. Units for systemd (a hardened system unit and a user unit for shared
-seedboxes) are in [contrib/systemd](contrib/systemd).
-
-Servers are added in the web UI (or the API). A server's host key must be confirmed by fingerprint
-before first use, and a changed key blocks the server until you review it. Hopsync can generate a
-per-server ed25519 key (sealed in its vault) and install it with the account password once, so no
-password is stored.
-
-## Numbers
-
-Release build. Medians of 3 runs on loopback with tmpfs on both sides: 512 MiB file, 2,000 files
-of 0.5 to 4.5 KiB. `benches/bench.py` reproduces them; details are in
-[docs/phase1/benchmarks.md](docs/phase1/benchmarks.md).
-
-| Scenario | hopsync | scp | sftp |
-|---|---|---|---|
-| Push one 512 MiB file | **734 MB/s** | 526 MB/s | 527 MB/s |
-| Pull one 512 MiB file | **1057 MB/s** | 573 MB/s | 568 MB/s |
-| Push 2,000 small files | **0.30 s** | 0.65 s | 0.52 s |
-| Pull 2,000 small files | **0.28 s** | 0.67 s | 0.66 s |
-| Peak client memory (big file) | 40 MiB | 12 MiB | 13 MiB |
-
-Over a real 200 ms link to a shared seedbox (256 MiB file, 300 small files, 2 runs):
-
-| Scenario | hopsync | scp | sftp |
-|---|---|---|---|
-| Push one 256 MiB file | **11.7 MB/s** | 5.9 MB/s | 6.1 MB/s |
-| Pull one 256 MiB file | **15.7 MB/s** | 7.9 MB/s | 7.5 MB/s |
-| Push 300 small files | **39 s** | 249 s | 188 s |
-| Pull 300 small files | **31 s** | 250 s | 252 s |
-
-There the gap comes from parallel lanes and from keeping many small files in flight against the
-round-trip time.
+[contrib/systemd](contrib/systemd) has a hardened system unit, and a user unit for shared seedboxes
+where you have no root. Install steps are at the top of each file.
 
 ## Security
 
-Hopsync handles credentials for every server it reaches, so security is a design requirement (see
-[CLAUDE.md](CLAUDE.md) §3). Host keys are pinned, local paths cannot leave their root (`openat2`
-with `RESOLVE_BENEATH`), nothing is ever run through a shell, and text a server sends is escaped
-before it reaches your terminal. The daemon requires a login from first start (no default
-password), seals stored keys with a key kept outside its database, refuses cross-origin and
-DNS-rebinding requests, and runs no commands. The web UI loads nothing from other sites, runs
-no inline script, and shows server-supplied names only as text. Reviews:
-[Phase 1](docs/phase1/security-review.md), [Phase 2](docs/phase2/security-review.md),
-[Phase 3](docs/phase3/security-review.md).
+Hopsync holds SSH credentials for every server it reaches, so these are hard rules:
+
+- Host keys are pinned. A changed key blocks the server until you review it.
+- Local paths cannot leave their root (`openat2` with `RESOLVE_BENEATH`). Nothing runs through a
+  shell, and no setting or API call can run a command.
+- The web UI needs a login from first start. Stored keys are sealed with a key kept outside the
+  database. Cross-origin and DNS-rebinding requests are refused.
+- The UI has a strict Content Security Policy (`default-src 'self'`) and shows names from servers
+  only as text. A browser test checks both, using a hostile file name.
+- Dependencies are pinned by `Cargo.lock` and `pnpm-lock.yaml`. npm install scripts are off, and npm
+  packages under 14 days old are refused.
+
+Hopsync has no built-in TLS yet. Keep it on loopback behind an SSH tunnel, or put a TLS reverse proxy
+in front and use `--secure-cookies`.
+
+Every review so far was done by the people and tools that built the code, so none is independent.
+Read them here: [engine](docs/phase1/security-review.md), [daemon](docs/phase2/security-review.md),
+[web UI](docs/phase3/security-review.md), [React UI](docs/phase3/react-security-review.md).
+
+## Project status
+
+| Area | State |
+|---|---|
+| Transfer engine and CLI | Done |
+| Daemon, job queue and JSON API | Done |
+| Web UI | Done |
+| Built-in TLS, fuzzing, CI | Not started |
+| Release binaries and packages (`.deb`, AUR, Docker) | Not started |
+| Independent security review | Not started |
+| Comparison with `rsync`, `rclone` and `lftp`, and a 1 Gbps test | Not started |
+
+Known limits today:
+
+- The queue shows a percentage and time left only for a single-file upload. Downloads and folders
+  show speed and bytes so far.
+- A transfer runs between the box running Hopsync and one server. To copy between two other boxes,
+  run Hopsync on one of them.
+- Symlinks are skipped and reported.
+- There is one admin account.
+
+The roadmap and every design decision with its reason are in [plan.md](plan.md).
+
+## Documentation
+
+| Topic | Where |
+|---|---|
+| Design, roadmap and decision log | [plan.md](plan.md) |
+| Benchmark method and results | [docs/phase1/benchmarks.md](docs/phase1/benchmarks.md) |
+| Research on SSH libraries and link behavior | [docs/phase0](docs/phase0) |
+| UX study of rclone, rsync, lsyncd and FileZilla | [docs/research/ux-study.md](docs/research/ux-study.md) |
+
+## Development
+
+```bash
+cargo test --workspace
+cd crates/hopsync/web
+pnpm dev         # UI with hot reload, proxied to a daemon on 127.0.0.1:7890
+pnpm test        # unit tests
+pnpm typecheck
+pnpm e2e         # browser test with a real daemon and sshd, needs Python playwright
+```
+
+Project rules for contributors are in [CLAUDE.md](CLAUDE.md). The short version: research before
+choosing a dependency, list edge cases before coding, add a test with every bug fix, and treat
+security and the performance budget as features.
 
 ## License
 
-MIT OR Apache-2.0, at your option.
+Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
