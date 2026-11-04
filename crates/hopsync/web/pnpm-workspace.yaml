@@ -1,0 +1,2 @@
+# Refuse any package, direct or indirect, published in the last 14 days (in minutes).
+minimumReleaseAge: 20160

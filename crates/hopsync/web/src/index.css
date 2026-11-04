@@ -1,0 +1,352 @@
+/* Design tokens and shared component classes. Fonts are compiled into the binary, never fetched. */
+
+@import "tailwindcss";
+
+@font-face {
+  font-family: "Inter Variable";
+  src: url("../node_modules/@fontsource-variable/inter/files/inter-latin-wght-normal.woff2") format("woff2-variations");
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "JetBrains Mono Variable";
+  src: url("../node_modules/@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2") format("woff2-variations");
+  font-weight: 100 800;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: dark;
+  --bg: #0d0f12;
+  --surface: #14171c;
+  --raised: #1b1f26;
+  --hover: #20252d;
+  --line: #272c35;
+  --line-strong: #3a414d;
+  --text: #e8eaed;
+  --muted: #98a1ad;
+  --accent: #4c8dff;
+  --accent-text: #06101f;
+  --selected: #1b2c4a;
+  --ok: #3ecf8e;
+  --warn: #f0b429;
+  --bad: #f47d7d;
+  --only: #12291f;
+  --differs: #2e2510;
+  --series-down: #199e70;
+  --series-up: #3987e5;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f5f7;
+  --surface: #ffffff;
+  --raised: #f8f9fa;
+  --hover: #eef0f3;
+  --line: #e1e4e9;
+  --line-strong: #c9ced6;
+  --text: #14171c;
+  --muted: #5b6470;
+  --accent: #2563d9;
+  --accent-text: #ffffff;
+  --selected: #dce8fc;
+  --ok: #0f7b4f;
+  --warn: #975700;
+  --bad: #c4322b;
+  --only: #e7f6ee;
+  --differs: #fdf3e0;
+  --series-down: #1baf7a;
+  --series-up: #2a78d6;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-raised: var(--raised);
+  --color-hover: var(--hover);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-text: var(--text);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-text: var(--accent-text);
+  --color-selected: var(--selected);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-bad: var(--bad);
+  --color-only: var(--only);
+  --color-differs: var(--differs);
+  --color-series-down: var(--series-down);
+  --color-series-up: var(--series-up);
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+@layer base {
+  html {
+    background: var(--bg);
+  }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1 {
+    font-size: 18px;
+    font-weight: 600;
+    text-wrap: balance;
+  }
+  h2 {
+    font-size: 14px;
+    font-weight: 600;
+    text-wrap: balance;
+  }
+  p {
+    text-wrap: pretty;
+  }
+  code {
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  button {
+    cursor: pointer;
+  }
+  button:disabled {
+    cursor: default;
+  }
+  input[type="checkbox"],
+  input[type="radio"] {
+    accent-color: var(--accent);
+    width: 14px;
+    height: 14px;
+  }
+}
+
+@layer components {
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 30px;
+    padding: 0 10px;
+    border: 1px solid var(--line-strong);
+    border-radius: 6px;
+    background: var(--raised);
+    color: var(--text);
+    font-weight: 500;
+    white-space: nowrap;
+    transition:
+      background-color 120ms ease-out,
+      opacity 120ms ease-out,
+      transform 100ms ease-out;
+  }
+  .btn:hover:not(:disabled) {
+    background: var(--hover);
+  }
+  .btn:active:not(:disabled) {
+    transform: scale(0.98);
+  }
+  .btn:disabled {
+    opacity: 0.45;
+  }
+  .btn-primary {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--accent-text);
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: var(--accent);
+    opacity: 0.9;
+  }
+  .btn-ghost {
+    border-color: transparent;
+    background: transparent;
+    color: var(--muted);
+  }
+  .btn-ghost:hover:not(:disabled) {
+    color: var(--text);
+  }
+  .btn-warn {
+    border-color: var(--warn);
+    background: transparent;
+    color: var(--warn);
+  }
+  .btn-danger {
+    border-color: var(--bad);
+    background: transparent;
+    color: var(--bad);
+  }
+  .btn-sm {
+    height: 26px;
+    padding: 0 8px;
+    font-size: 12px;
+  }
+  .btn-icon {
+    width: 26px;
+    height: 26px;
+    padding: 0;
+  }
+  .input {
+    width: 100%;
+    height: 32px;
+    padding: 0 8px;
+    border: 1px solid var(--line-strong);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+  }
+  .input:disabled {
+    opacity: 0.5;
+  }
+  textarea.input {
+    height: auto;
+    padding: 6px 8px;
+    resize: vertical;
+  }
+  .card {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--surface);
+  }
+  .link {
+    color: var(--accent);
+    text-align: left;
+  }
+  .link:hover {
+    text-decoration: underline;
+  }
+
+  /* Native dialog: the browser traps focus, handles Escape and restores focus on close. */
+  dialog.modal {
+    margin: auto;
+    width: min(520px, calc(100vw - 32px));
+    max-height: calc(100dvh - 32px);
+    overflow: auto;
+    padding: 20px;
+    border: 1px solid var(--line-strong);
+    border-radius: 10px;
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: 0 16px 48px rgb(0 0 0 / 0.4);
+    opacity: 0;
+    transform: translateY(6px);
+    transition:
+      opacity 150ms ease-out,
+      transform 150ms ease-out,
+      display 150ms allow-discrete,
+      overlay 150ms allow-discrete;
+  }
+  dialog.modal[open] {
+    opacity: 1;
+    transform: none;
+  }
+  @starting-style {
+    dialog.modal[open] {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+  }
+  dialog.modal-wide {
+    width: min(760px, calc(100vw - 32px));
+  }
+  dialog.modal::backdrop {
+    background: rgb(0 0 0 / 0.55);
+  }
+
+  /* Progress moves on the compositor: `scaleX` from the left, never `width`. */
+  .bar-track {
+    height: 4px;
+    overflow: hidden;
+    border-radius: 2px;
+    background: var(--line);
+  }
+  .bar-fill {
+    height: 100%;
+    background: var(--accent);
+    transform-origin: left;
+    transition: transform 500ms linear;
+  }
+  .bar-unknown {
+    width: 30%;
+    animation: bar-slide 1.4s ease-in-out infinite;
+  }
+  .skeleton {
+    border-radius: 4px;
+    background: var(--raised);
+    animation: skeleton-pulse 1.2s ease-in-out infinite;
+  }
+
+  .file-grid {
+    display: grid;
+    grid-template-columns: 22px minmax(0, 1fr) 76px 138px;
+    align-items: center;
+    column-gap: 8px;
+    padding: 0 10px;
+  }
+  .row-height {
+    height: 30px;
+  }
+  .scroller {
+    overflow: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--line-strong) transparent;
+  }
+}
+
+@keyframes bar-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(340%);
+  }
+}
+
+@keyframes skeleton-pulse {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* Touch screens get larger targets; the dense row height is for a mouse. */
+@media (pointer: coarse) {
+  .row-height {
+    height: 44px;
+  }
+  .btn {
+    height: 40px;
+  }
+  .btn-sm,
+  .btn-icon {
+    height: 36px;
+    min-width: 36px;
+  }
+}
+
+@media (max-width: 640px) {
+  .file-grid {
+    grid-template-columns: 22px minmax(0, 1fr) 72px;
+  }
+  .file-grid > .col-modified {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -198,6 +198,8 @@ pub struct SettingsUpdate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Progress {
     pub job: i64,
+    /// Lets a client total upload and download speed without fetching the job list.
+    pub direction: Direction,
     /// Bytes moved so far; pieces redone after a reconnect count again.
     pub bytes: u64,
     pub files: u64,
@@ -229,6 +231,7 @@ struct Running {
     /// Why the job is being stopped: `Paused` or `Cancelled`.
     stop: Mutex<Option<JobState>>,
     counters: Arc<Counters>,
+    direction: Direction,
     total: Option<u64>,
     /// Bytes and time at the last snapshot, and the smoothed rate.
     last: Mutex<(u64, Instant, f64)>,
@@ -502,6 +505,7 @@ impl Service {
                 }
                 Progress {
                     job,
+                    direction: r.direction,
                     bytes,
                     files: r.counters.files.load(Ordering::Relaxed),
                     problems: r.counters.problems.load(Ordering::Relaxed),
@@ -1117,6 +1121,7 @@ impl Service {
                 cancel: watch::channel(false).0,
                 stop: Mutex::new(None),
                 counters: Arc::default(),
+                direction: next.spec.direction,
                 total,
                 last: Mutex::new((0, Instant::now(), 0.0)),
             });
@@ -1326,5 +1331,26 @@ impl Service {
 
     pub fn queue_paused(&self) -> bool {
         self.queue_paused.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::{Direction, Progress};
+
+    /// The UI totals upload and download speed from this field.
+    #[test]
+    fn progress_tells_clients_its_direction() {
+        let p = Progress {
+            job: 1,
+            direction: Direction::Pull,
+            bytes: 2,
+            files: 3,
+            problems: 0,
+            rate: 4,
+            total: None,
+        };
+        let json = serde_json::to_value(&p).expect("json");
+        assert_eq!(json["direction"], "pull");
     }
 }
