@@ -1,0 +1,26 @@
+# Build output
+/target/
+__pycache__/
+
+# Private data: results from real servers name the host and account. Keep them local.
+docs/**/results/wan-*.jsonl
+/private/
+
+# Secrets and runtime state, should one ever land in the tree
+*.pem
+id_ed25519*
+id_rsa*
+known_hosts
+vault.key
+setup-token
+*.db
+*.sqlite
+.env
+*.local.*
+
+# Personal agent tooling (installed per developer, not part of the project)
+/.osa/
+/.agents/
+/.claude/
+/.grok/
+/.zcode/
