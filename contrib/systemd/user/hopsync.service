@@ -1,0 +1,27 @@
+# User unit, for shared seedboxes without root:
+#   mkdir -p ~/.config/systemd/user && cp hopsync.service ~/.config/systemd/user/
+#   systemctl --user enable --now hopsync
+#   loginctl enable-linger "$USER"    # keep it running after you log out, if allowed
+# On first start, read the one-time setup token: cat ~/.local/share/hopsync/setup-token
+# Data lives in ~/.local/share/hopsync; transfers stay below your home directory.
+
+[Unit]
+Description=Hopsync file transfer service
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/hopsync serve --listen 127.0.0.1:7890
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=default.target
