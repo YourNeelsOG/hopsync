@@ -12,7 +12,8 @@
   <a href="#build-from-source">Build</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#security">Security</a> ·
-  <a href="#documentation">Documentation</a>
+  <a href="#documentation">Documentation</a> ·
+  <a href="#contributing">Contributing</a>
 </p>
 
 <picture>
@@ -259,9 +260,22 @@ pnpm typecheck
 pnpm e2e         # browser test with a real daemon and sshd, needs Python playwright
 ```
 
-Project rules for contributors are in [CLAUDE.md](CLAUDE.md). The short version: research before
+## Contributing
+
+`main` is production and only the maintainer can change it. All new work goes to `dev` through a pull
+request:
+
+```mermaid
+flowchart LR
+    work["Your branch<br>(in your fork)"] -->|pull request| dev
+    dev -->|maintainer merges| main
+    main --> prod["Production"]
+```
+
+Create your branch from `dev`, and use `dev` as the base branch of your pull request. Research before
 choosing a dependency, list edge cases before coding, add a test with every bug fix, and treat
-security and the performance budget as features.
+security and the performance budget as features. The steps and checks are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

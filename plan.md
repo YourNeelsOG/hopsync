@@ -334,6 +334,7 @@ Notes and results: `docs/phase0/`.
 | 2026-11-04 | Hashed files under `/assets/` are cached for a year and served gzipped when accepted; everything else stays `no-store` | A hash in the name means the content cannot change, and they hold no data. Loading the bundle over a 200 ms tunnel should not repeat on every page load. |
 | 2026-11-04 | Default theme is dark, with a light theme a click away | An assumption, not an owner decision: the owner saw this direction and did not object, so it is easy to change. The choice lives in `localStorage` as a per-viewer convenience. |
 | 2026-11-04 | SSE sends a named `heartbeat` event every 5 s when idle and re-checks its session then; the UI reconnects after 15 s of silence | Keep-alive comments are invisible to `EventSource`, so a stalled stream looked like a healthy idle one. The browser test also found that on an idle daemon a revoked session's stream stayed open forever: the session was checked only when a snapshot changed. |
+| 2026-11-04 | `main` is production and only the owner can change it; new work reaches `dev` by pull request; enforced with repository rulesets | Owner choice: keep production stable while accepting outside work. Compared with classic branch protection, whose per-user push restrictions exist only for organization repositories. A ruleset can restrict updates to `main` and let only the repository admin role bypass. |
 
 ## 11. Open questions (owner to decide)
 
