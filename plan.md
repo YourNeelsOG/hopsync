@@ -1,6 +1,6 @@
 # Hopsync: Design & Plan
 
-**Status:** approved by owner 2026-11-03; Phases 0 and 1 done, Phase 2 done (2026-11-04), Phase 3 done (2026-11-04)
+**Status:** approved by owner 2026-11-03; Phases 0 and 1 done, Phase 2 done (2026-11-04), Phase 3 done (2026-11-04), web UI moved to React (2026-11-04, `docs/plans/2026-11-04-react-ui-plan.md`); Phase 4 not started
 **Language:** Rust
 **License:** MIT OR Apache-2.0
 **Rules:** every contributor and agent follows `CLAUDE.md` in this folder.
@@ -115,7 +115,7 @@ like FileZilla, it does not need Hopsync installed.
 | SSH transport | `russh`; `openssh` + `openssh-sftp-client` (uses system `ssh` with multiplexing); `ssh2` (libssh2) | throughput per connection, cipher support (AES-GCM, ChaCha20), CPU per Gbps, host-key API, maintenance, RustSec history |
 | SFTP client | `russh-sftp`; `openssh-sftp-client` | request pipelining depth, max request size, extension support (`limits@`, `fsync@`, `statvfs@`, `posix-rename@`) |
 | Web server | `axum` + `tower` | n/a |
-| Frontend | small framework with minimal deps (e.g. Svelte or Solid) built to static files, embedded via `rust-embed`/`include_dir` | bundle size, dependency count |
+| Frontend | Decided: React, TypeScript, Vite and Tailwind, built to static files and embedded by `build.rs` with `include_bytes!` (Decision log 2026-11-04) | bundle size, dependency count |
 | DB | `rusqlite` vs `sqlx` (SQLite) | footprint, sync vs async fit |
 | Password hashing | `argon2` | n/a |
 | Secret encryption | `chacha20poly1305` / `aes-gcm` (RustCrypto) or `age` | audited, maintained |
@@ -249,6 +249,9 @@ Notes and results: `docs/phase0/`.
   history, settings.
 
 ### Phase 4: Hardening & packaging
+- Show a percentage and time left for downloads and folders. Today only a single-file upload has a
+  total, because the daemon learns other totals only by asking the remote or walking the tree.
+- CI that runs the audits, tests and browser run, and builds releases with `HOPSYNC_REQUIRE_UI=1`.
 - TLS, rate limiting, audit log, fuzzing of path/listing parsing, systemd sandboxing.
 - Static builds (x86_64, aarch64, armv7), AUR, `.deb`, Docker image, signed releases, docs, benchmark page.
 
@@ -322,6 +325,16 @@ Notes and results: `docs/phase0/`.
 | 2026-11-04 | The UI is served by the same router at `/`, unauthenticated, behind the same Host check and headers | Assets hold no data; every data call is an authenticated API request. One origin keeps cookies SameSite=Strict and CSRF checks simple. |
 | 2026-11-04 | Event streams re-check their session before each snapshot, without refreshing its idle timer | The middleware checks a session once per request, and a stream lives for hours: after logout or a password change it kept streaming (Phase 3 review W2). Re-checking only on a change costs one indexed read per snapshot; not touching `seen` keeps a forgotten open tab from holding a session alive. |
 | 2026-11-04 | Shutdown ends event streams and gives other requests 5 seconds | Graceful shutdown waited for every open browser tab, so SIGTERM never stopped the daemon (Phase 3 review W1). A key install or a large listing may still be cut at 5 s; the jobs it would affect are resumable. |
+| 2026-11-04 | Web UI moves to React 19, TypeScript, Vite and Tailwind 4 (replaces the plain JavaScript decision above) | Owner choice: the UI must stay easy to change and upgrade over the long run. Studied `autobrr/qui` (GPL-2.0-or-later, so ideas only, never its code). Its fast live numbers come from updating only what changed and from virtual lists, which this stack gives directly. Cost: an npm supply chain, contained by the entries below. |
+| 2026-11-04 | npm supply chain: exact versions; pnpm 10 `minimumReleaseAge` refuses anything under 14 days old, direct or indirect; `pnpm-lock.yaml` committed; install scripts off; `pnpm audit` before a release | CLAUDE.md §3. Hopsync holds SSH credentials, so a compromised package is the main new risk. Most malicious releases are found within days. Nothing from npm runs on the server: only the built files ship, and they are compiled into the binary. |
+| 2026-11-04 | Native `<dialog>` instead of Radix Dialog; own toasts instead of Sonner; native `<select>`; Radix used only for Tabs | Read the packages: Sonner and `react-style-singleton` (under Radix Dialog) add `<style>` elements at runtime, which the CSP blocks. Native `<dialog>` already traps focus and handles Escape. `@radix-ui/react-tabs` adds no styles. The CSP stays `default-src 'self'`. |
+| 2026-11-04 | `motion` for animated numbers and enter or exit transitions, without `popLayout` or view transitions | Those two features inject `<style>`. The rest writes through the CSSOM, which the CSP allows. Numbers animate through motion values that write to the DOM directly, so a 60 fps counter causes no React render. Compared with CSS only, which cannot interpolate digits. |
+| 2026-11-04 | `@tanstack/react-virtual` for file and result lists | Listings reach 100,000 entries (Decision above), and every row in the DOM made big folders slow. qui uses the same library. Compared with `react-window`, which has fixed-size assumptions and needs an extra package for auto-sizing. |
+| 2026-11-04 | `dist/` is not committed; `build.rs` embeds it, or a page that says how to build it; `HOPSYNC_REQUIRE_UI=1` turns a missing UI into a build error | Compared with committing bundles (unreviewable diffs) and with `build.rs` running pnpm (npm code running inside `cargo build`, and no offline builds). Rust contributors still build and test without node. Release builds set the variable. The generated table needs no new crate. |
+| 2026-11-04 | Hashed files under `/assets/` are cached for a year and served gzipped when accepted; everything else stays `no-store` | A hash in the name means the content cannot change, and they hold no data. Loading the bundle over a 200 ms tunnel should not repeat on every page load. |
+| 2026-11-04 | Default theme is dark, with a light theme a click away | An assumption, not an owner decision: the owner saw this direction and did not object, so it is easy to change. The choice lives in `localStorage` as a per-viewer convenience. |
+| 2026-11-04 | SSE sends a named `heartbeat` event every 5 s when idle and re-checks its session then; the UI reconnects after 15 s of silence | Keep-alive comments are invisible to `EventSource`, so a stalled stream looked like a healthy idle one. The browser test also found that on an idle daemon a revoked session's stream stayed open forever: the session was checked only when a snapshot changed. |
+| 2026-11-04 | `main` is production and only the owner can change it; new work reaches `dev` by pull request; enforced with repository rulesets | Owner choice: keep production stable while accepting outside work. Compared with classic branch protection, whose per-user push restrictions exist only for organization repositories. A ruleset can restrict updates to `main` and let only the repository admin role bypass. |
 
 ## 11. Open questions (owner to decide)
 

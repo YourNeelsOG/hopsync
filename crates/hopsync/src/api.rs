@@ -7,8 +7,9 @@
 //!   and PUT bodies must be `application/json` (an HTML form cannot send that cross-site without
 //!   a CORS preflight, which this server never approves).
 //! - On a loopback listener, the `Host` header must name a loopback host (DNS rebinding).
-//! - Every response carries `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
-//!   `Referrer-Policy: no-referrer` and a CSP that allows nothing but this origin.
+//! - Every response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and
+//!   a CSP that allows nothing but this origin. All but hashed UI files carry `Cache-Control:
+//!   no-store`.
 //! - Live progress is Server-Sent Events at `/api/events`: one `snapshot` event whenever the
 //!   service's snapshot changes. Slow clients skip snapshots; nothing queues per client.
 //! - Errors are `{"error": "..."}`. Internal failures are logged and answered without detail.
@@ -20,7 +21,7 @@ use std::time::Duration;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -128,11 +129,16 @@ async fn blocking<T: Send + 'static>(
         .map_err(Into::into)
 }
 
+/// How often an idle event stream re-checks its session and shows the UI it is alive. The UI gives
+/// up after three of these (`STALL_MS` in `live.ts`).
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
+
 pub fn router(svc: Arc<Service>, transport: Transport) -> Router {
     let state = AppState { svc };
     let open = Router::new()
         .route("/", get(asset))
         .route("/{file}", get(asset))
+        .route("/assets/{file}", get(hashed_asset))
         .route("/api/health", get(health))
         .route("/api/setup", post(setup))
         .route("/api/login", post(login));
@@ -181,7 +187,10 @@ async fn security_headers(req: Request, next: Next) -> Response {
     let set = |h: &mut HeaderMap, k: header::HeaderName, v: &'static str| {
         h.insert(k, HeaderValue::from_static(v));
     };
-    set(h, header::CACHE_CONTROL, "no-store");
+    // Only `hashed_asset` sets its own: everything else, data above all, is never stored.
+    if !h.contains_key(header::CACHE_CONTROL) {
+        set(h, header::CACHE_CONTROL, "no-store");
+    }
     set(h, header::X_CONTENT_TYPE_OPTIONS, "nosniff");
     set(h, header::REFERRER_POLICY, "no-referrer");
     set(h, header::X_FRAME_OPTIONS, "DENY");
@@ -629,12 +638,19 @@ async fn events(
         .then(|| session_token(&headers))
         .flatten();
     let svc = st.svc.clone();
-    // The first poll sends the current snapshot; later ones wait for a change.
+    // The first poll sends the current snapshot; later ones wait for a change or the next
+    // heartbeat. Waking on a heartbeat bounds how long a revoked session's stream stays open when
+    // the daemon is idle. The heartbeat is a named event with data, because `EventSource` hides
+    // comments and drops events without data, and the UI must tell a stalled stream from an idle one.
     let stream = futures_util::stream::unfold((rx, true), move |(mut rx, first)| {
         let (svc, token) = (svc.clone(), token.clone());
         async move {
+            let mut heartbeat = false;
             if !first {
-                rx.changed().await.ok()?;
+                match tokio::time::timeout(HEARTBEAT_EVERY, rx.changed()).await {
+                    Ok(changed) => changed.ok()?,
+                    Err(_) => heartbeat = true,
+                }
                 if let Some(token) = token {
                     let live = blocking(move || Ok(svc.auth.session_live(&token))).await;
                     if !matches!(live, Ok(true)) {
@@ -642,17 +658,21 @@ async fn events(
                     }
                 }
             }
-            let snap = rx.borrow_and_update().clone();
-            let event = Event::default()
-                .event("snapshot")
-                .json_data(&*snap)
-                .map_err(axum::Error::new);
+            let event = if heartbeat {
+                Ok(Event::default().event("heartbeat").data("1"))
+            } else {
+                let snap = rx.borrow_and_update().clone();
+                Event::default()
+                    .event("snapshot")
+                    .json_data(&*snap)
+                    .map_err(axum::Error::new)
+            };
             Some((event, (rx, false)))
         }
     });
     // Ends with the daemon, or graceful shutdown would wait for every open browser tab.
     let stream = futures_util::StreamExt::take_until(stream, st.svc.stopping());
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(stream)
 }
 
 #[derive(Deserialize)]
@@ -685,73 +705,154 @@ async fn put_settings(
     Ok(Json(st.svc.update_settings(&u)?).into_response())
 }
 
-/// The UI, compiled into the binary (Decision log 2026-11-04): never read from disk or fetched.
-const ASSETS: &[(&str, &str, &[u8])] = &[
-    (
-        "",
-        "text/html; charset=utf-8",
-        include_bytes!("../web/index.html"),
-    ),
-    (
-        "app.js",
-        "text/javascript; charset=utf-8",
-        include_bytes!("../web/app.js"),
-    ),
-    (
-        "app.css",
-        "text/css; charset=utf-8",
-        include_bytes!("../web/app.css"),
-    ),
-    (
-        "icon.svg",
-        "image/svg+xml",
-        include_bytes!("../web/icon.svg"),
-    ),
-];
+/// One file of the UI, compiled into the binary (Decision log 2026-11-04): never read from disk or
+/// fetched. `build.rs` generates the table from `web/dist`.
+struct Asset {
+    /// Path without the leading slash; the page itself is "".
+    name: &'static str,
+    ctype: &'static str,
+    body: &'static [u8],
+    gzip: Option<&'static [u8]>,
+}
 
-async fn asset(file: Option<Path<String>>) -> Response {
-    let name = file.map(|Path(f)| f).unwrap_or_default();
-    match ASSETS.iter().find(|(n, _, _)| *n == name) {
-        Some((_, ctype, body)) => (
-            [(header::CONTENT_TYPE, HeaderValue::from_static(ctype))],
-            *body,
-        )
-            .into_response(),
-        None => err(StatusCode::NOT_FOUND, "not found").into_response(),
+include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
+
+/// The browser accepts gzip: named in `Accept-Encoding` and not refused with `q=0`.
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    header_str(headers, header::ACCEPT_ENCODING).is_some_and(|v| {
+        v.split(',').any(|part| {
+            let mut bits = part.split(';').map(str::trim);
+            let named = bits.next().is_some_and(|c| c.eq_ignore_ascii_case("gzip"));
+            named
+                && !bits.any(|p| {
+                    p.strip_prefix("q=")
+                        .and_then(|q| q.parse::<f32>().ok())
+                        .is_some_and(|q| q == 0.0)
+                })
+        })
+    })
+}
+
+fn asset_response(name: &str, headers: &HeaderMap, cache: Option<&'static str>) -> Response {
+    let Some(a) = ASSETS.iter().find(|a| a.name == name) else {
+        return err(StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let mut r = match a.gzip.filter(|_| accepts_gzip(headers)) {
+        Some(gz) => {
+            let mut r = gz.into_response();
+            r.headers_mut()
+                .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            r
+        }
+        None => a.body.into_response(),
+    };
+    let h = r.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(a.ctype));
+    if a.gzip.is_some() {
+        h.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
     }
+    if let Some(c) = cache {
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static(c));
+    }
+    r
+}
+
+async fn asset(file: Option<Path<String>>, headers: HeaderMap) -> Response {
+    let name = file.map(|Path(f)| f).unwrap_or_default();
+    // Files under `assets/` get the route below, with its caching.
+    asset_response(&name, &headers, None)
+}
+
+/// Vite puts a content hash in these names, so a cached copy can never be stale.
+async fn hashed_asset(Path(file): Path<String>, headers: HeaderMap) -> Response {
+    asset_response(
+        &format!("assets/{file}"),
+        &headers,
+        Some("public, max-age=31536000, immutable"),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ASSETS, loopback_host};
 
-    /// The UI rules from the Phase 3 plan, checked on the shipped bytes: text reaches the page only
-    /// as text, nothing inline that the CSP would have to allow, and nothing loaded from elsewhere.
+    /// Removes `//` line comments and `/* */` block comments' lines: comments may name the rules.
+    fn without_comment_lines(text: &str) -> String {
+        text.lines()
+            .filter(|l| {
+                let l = l.trim_start();
+                !l.starts_with("//") && !l.starts_with("/*") && !l.starts_with('*')
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn source_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read web/src") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                source_files(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The UI rules from the Phase 3 plan, checked on the code we write. A bundle holds React's own
+    /// internals (`innerHTML`, namespace URLs), so these words can no longer be checked on it; the
+    /// next test checks what can be checked on the shipped bytes, and the browser run (`web/e2e`)
+    /// checks for CSP violations and shows a hostile file name as text.
     #[test]
-    fn ui_assets_keep_the_safety_rules() {
-        let forbidden: &[(&str, &[&str])] = &[
-            (
-                "app.js",
+    fn ui_source_keeps_the_safety_rules() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src");
+        let mut files = Vec::new();
+        source_files(&src, &mut files);
+        assert!(!files.is_empty(), "no UI source in {}", src.display());
+        for file in files {
+            if file.to_string_lossy().contains(".test.") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).expect("read source");
+            let code = without_comment_lines(&text);
+            let forbidden: &[&str] = if file.extension().is_some_and(|e| e == "css") {
+                &["@import url", "http://", "https://"]
+            } else {
                 &[
+                    "dangerouslySetInnerHTML",
                     "innerHTML",
                     "outerHTML",
                     "insertAdjacentHTML",
                     "document.write",
                     "eval(",
                     "new Function",
-                    ".style.",
                     "setAttribute(\"style",
                     "setAttribute(\"on",
                     "javascript:",
                     "http://",
                     "https://",
                     "import(",
-                ],
-            ),
-            ("app.css", &["@import", "url(", "http://", "https://"]),
-            (
-                "",
-                &[
+                    // Both inject <style> elements, which the CSP blocks (Decision log).
+                    "popLayout",
+                    "AnimateView",
+                ]
+            };
+            for word in forbidden {
+                assert!(!code.contains(word), "{} contains {word:?}", file.display());
+            }
+        }
+    }
+
+    /// What ships: nothing inline in the page, nothing fetched from elsewhere by the page or CSS,
+    /// and no code built from strings (the CSP has no `unsafe-eval`, so it could not run anyway).
+    #[test]
+    fn shipped_assets_keep_the_safety_rules() {
+        for a in ASSETS {
+            if a.ctype.starts_with("font/") {
+                continue;
+            }
+            let text = std::str::from_utf8(a.body).expect("utf-8");
+            let forbidden: &[&str] = match a.ctype {
+                t if t.starts_with("text/html") => &[
                     "style=",
                     " onload=",
                     " onclick=",
@@ -759,21 +860,31 @@ mod tests {
                     "http://",
                     "https://",
                 ],
-            ),
-        ];
-        for (name, words) in forbidden {
-            let (_, _, bytes) = ASSETS.iter().find(|(n, _, _)| n == name).expect("asset");
-            let text = std::str::from_utf8(bytes).expect("utf-8");
-            // Comments may name the rules they follow.
-            let code: String = text
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("/*"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            for w in *words {
-                assert!(!code.contains(w), "{name:?} contains {w:?}");
+                t if t.starts_with("text/css") => &["@import", "url(http", "url(//"],
+                t if t.starts_with("text/javascript") => &["new Function(", "eval("],
+                _ => &[],
+            };
+            for word in forbidden {
+                assert!(!text.contains(word), "{:?} contains {word:?}", a.name);
             }
         }
+    }
+
+    #[test]
+    fn gzip_needs_the_browser_to_accept_it() {
+        use super::{HeaderMap, HeaderValue, accepts_gzip, header};
+        let with = |v: &'static str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::ACCEPT_ENCODING, HeaderValue::from_static(v));
+            accepts_gzip(&h)
+        };
+        assert!(with("gzip"));
+        assert!(with("br, gzip;q=0.5"));
+        assert!(with("GZIP"));
+        assert!(!with("gzip;q=0"));
+        assert!(!with("br"));
+        assert!(!with("x-gzip-not"));
+        assert!(!accepts_gzip(&HeaderMap::new()));
     }
 
     #[test]

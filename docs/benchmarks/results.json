@@ -1,0 +1,148 @@
+{
+  "loopback": {
+    "runs": 3,
+    "scenarios": {
+      "pull-file": {
+        "hopsync": {
+          "mb_per_s": 1056.8,
+          "peak_mib": 31.6,
+          "secs": 0.508
+        },
+        "scp": {
+          "mb_per_s": 573.0,
+          "peak_mib": 13.2,
+          "secs": 0.937
+        },
+        "sftp": {
+          "mb_per_s": 567.5,
+          "peak_mib": 13.4,
+          "secs": 0.946
+        }
+      },
+      "pull-tree": {
+        "hopsync": {
+          "mb_per_s": 10.9,
+          "peak_mib": 9.7,
+          "secs": 0.278
+        },
+        "scp": {
+          "mb_per_s": 4.5,
+          "peak_mib": 12.3,
+          "secs": 0.665
+        },
+        "sftp": {
+          "mb_per_s": 4.6,
+          "peak_mib": 12.6,
+          "secs": 0.664
+        }
+      },
+      "push-file": {
+        "hopsync": {
+          "mb_per_s": 734.4,
+          "peak_mib": 40.1,
+          "secs": 0.731
+        },
+        "scp": {
+          "mb_per_s": 526.3,
+          "peak_mib": 12.4,
+          "secs": 1.02
+        },
+        "sftp": {
+          "mb_per_s": 526.9,
+          "peak_mib": 12.7,
+          "secs": 1.019
+        }
+      },
+      "push-tree": {
+        "hopsync": {
+          "mb_per_s": 10.1,
+          "peak_mib": 10.3,
+          "secs": 0.298
+        },
+        "scp": {
+          "mb_per_s": 4.6,
+          "peak_mib": 11.9,
+          "secs": 0.654
+        },
+        "sftp": {
+          "mb_per_s": 5.8,
+          "peak_mib": 12.1,
+          "secs": 0.521
+        }
+      }
+    }
+  },
+  "real_link": {
+    "runs": 2,
+    "scenarios": {
+      "pull-file": {
+        "hopsync": {
+          "mb_per_s": 15.7,
+          "peak_mib": 28.0,
+          "secs": 17.119
+        },
+        "scp": {
+          "mb_per_s": 7.9,
+          "peak_mib": 14.2,
+          "secs": 34.012
+        },
+        "sftp": {
+          "mb_per_s": 7.5,
+          "peak_mib": 14.4,
+          "secs": 35.654
+        }
+      },
+      "pull-tree": {
+        "hopsync": {
+          "mb_per_s": 0.0,
+          "peak_mib": 10.2,
+          "secs": 31.337
+        },
+        "scp": {
+          "mb_per_s": 0.0,
+          "peak_mib": 13.2,
+          "secs": 250.166
+        },
+        "sftp": {
+          "mb_per_s": 0.0,
+          "peak_mib": 13.4,
+          "secs": 251.544
+        }
+      },
+      "push-file": {
+        "hopsync": {
+          "mb_per_s": 11.7,
+          "peak_mib": 40.7,
+          "secs": 23.018
+        },
+        "scp": {
+          "mb_per_s": 5.9,
+          "peak_mib": 14.8,
+          "secs": 45.708
+        },
+        "sftp": {
+          "mb_per_s": 6.1,
+          "peak_mib": 14.8,
+          "secs": 43.91
+        }
+      },
+      "push-tree": {
+        "hopsync": {
+          "mb_per_s": 0.0,
+          "peak_mib": 10.5,
+          "secs": 39.021
+        },
+        "scp": {
+          "mb_per_s": 0.0,
+          "peak_mib": 12.9,
+          "secs": 248.952
+        },
+        "sftp": {
+          "mb_per_s": 0.0,
+          "peak_mib": 13.2,
+          "secs": 188.212
+        }
+      }
+    }
+  }
+}

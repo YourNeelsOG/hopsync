@@ -24,3 +24,7 @@ setup-token
 /.claude/
 /.grok/
 /.zcode/
+
+# Web UI: dependencies and build output (build.rs embeds dist)
+node_modules/
+/crates/hopsync/web/dist/

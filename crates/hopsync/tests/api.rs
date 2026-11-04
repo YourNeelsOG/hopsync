@@ -84,6 +84,20 @@ async fn raw(addr: SocketAddr, request: &str) -> (u16, String) {
     (status, text)
 }
 
+/// The script and stylesheet paths named by the UI page.
+fn shipped_paths(page: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for attr in ["src=\"", "href=\""] {
+        for part in page.split(attr).skip(1) {
+            let path = part.split('"').next().unwrap_or_default();
+            if path.ends_with(".js") || path.ends_with(".css") {
+                out.push(path.to_owned());
+            }
+        }
+    }
+    out
+}
+
 async fn logged_in(d: &Daemon) -> Client {
     let mut c = Client::new(Endpoint::Tcp(d.addr));
     let token = d.svc.auth.setup_token().expect("setup token");
@@ -487,24 +501,58 @@ async fn the_ui_is_served_from_the_binary_with_strict_headers() {
         "{page}"
     );
     assert!(lower.contains("content-security-policy: default-src 'self'"));
-    assert!(page.contains(r#"<script type="module" src="/app.js"></script>"#));
     assert!(
         !page.contains("<script>") && !page.contains("style=\""),
         "no inline code"
     );
-    for (path, ctype) in [
-        ("/app.js", "text/javascript; charset=utf-8"),
-        ("/app.css", "text/css; charset=utf-8"),
-        ("/icon.svg", "image/svg+xml"),
-    ] {
+    // A checkout without a built UI serves a page that says how to build it.
+    let paths = shipped_paths(&page);
+    if paths.is_empty() {
+        assert!(page.contains("pnpm"), "{page}");
+    }
+    assert!(paths.iter().all(|p| p.starts_with("/assets/")), "{paths:?}");
+    for path in &paths {
         let (status, text) = raw(d.addr, &get(path)).await;
+        let lower = text.to_ascii_lowercase();
         assert_eq!(status, 200, "{path}");
+        assert!(lower.contains("content-type: text/"), "{path}: {text:.300}");
         assert!(
-            text.to_ascii_lowercase()
-                .contains(&format!("content-type: {ctype}")),
-            "{path}: {text:.300}"
+            lower.contains("cache-control: public, max-age=31536000, immutable"),
+            "hashed files are cached: {text:.300}"
+        );
+        assert!(!lower.contains("no-store"), "{text:.300}");
+        assert!(lower.contains("x-content-type-options: nosniff"));
+        assert!(!lower.contains("content-encoding"), "{text:.300}");
+        // Gzip only when the browser says it can read it.
+        let gzipped = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept-Encoding: gzip, br\r\nConnection: close\r\n\r\n"
+        );
+        let (status, text) = raw(d.addr, &gzipped).await;
+        let lower = text.to_ascii_lowercase();
+        assert_eq!(status, 200, "{path}");
+        assert!(lower.contains("content-encoding: gzip"), "{text:.300}");
+        assert!(lower.contains("vary: accept-encoding"), "{text:.300}");
+        let refused = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept-Encoding: gzip;q=0\r\nConnection: close\r\n\r\n"
+        );
+        let (_, text) = raw(d.addr, &refused).await;
+        assert!(
+            !text.to_ascii_lowercase().contains("content-encoding"),
+            "{text:.300}"
         );
     }
+    // The placeholder page has no icon, so `cargo test` passes on a fresh checkout too.
+    if !paths.is_empty() {
+        let (status, text) = raw(d.addr, &get("/icon.svg")).await;
+        assert_eq!(status, 200);
+        let lower = text.to_ascii_lowercase();
+        assert!(lower.contains("content-type: image/svg+xml"), "{text:.300}");
+        assert!(lower.contains("cache-control: no-store"), "{text:.300}");
+    }
+    let (status, _) = raw(d.addr, &get("/assets/nope.js")).await;
+    assert_eq!(status, 404);
+    let (status, _) = raw(d.addr, &get("/assets/../../Cargo.toml")).await;
+    assert_ne!(status, 200);
     let (status, _) = raw(d.addr, &get("/nope.js")).await;
     assert_eq!(status, 404);
     let (status, _) = raw(d.addr, &get("/../Cargo.toml")).await;
@@ -660,4 +708,89 @@ async fn an_event_stream_ends_when_its_session_does() {
         "no snapshot after logout: {rest}"
     );
     assert!(ended.is_ok(), "the stream must end after logout");
+}
+
+/// Keep-alive comments never reach `EventSource`, so a stalled stream looked like an idle one. A
+/// named event with data is what the UI's watchdog can see.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_event_stream_sends_heartbeats_the_browser_can_see() {
+    let d = daemon().await;
+    let c = logged_in(&d).await;
+    let mut sse = tokio::net::TcpStream::connect(d.addr)
+        .await
+        .expect("connect");
+    sse.write_all(
+        format!(
+            "GET /api/events HTTP/1.1\r\nHost: {}\r\nCookie: {}\r\n\r\n",
+            d.addr,
+            c.cookie.clone().expect("cookie")
+        )
+        .as_bytes(),
+    )
+    .await
+    .expect("write");
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 4096];
+    let found = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let n = sse.read(&mut buf).await.expect("read");
+            seen.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&seen);
+            // Browsers drop an event without data.
+            if text.contains("event: heartbeat\ndata: ") {
+                break;
+            }
+            assert!(n > 0, "stream ended: {text}");
+        }
+    })
+    .await;
+    assert!(
+        found.is_ok(),
+        "no heartbeat: {}",
+        String::from_utf8_lossy(&seen)
+    );
+}
+
+/// Found by the browser test: the session was re-checked only when a snapshot changed, so on an idle
+/// daemon a revoked session's stream stayed open forever and the page never showed the login.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_event_stream_ends_when_its_session_does() {
+    let d = daemon().await;
+    let c = logged_in(&d).await;
+    let mut sse = tokio::net::TcpStream::connect(d.addr)
+        .await
+        .expect("connect");
+    sse.write_all(
+        format!(
+            "GET /api/events HTTP/1.1\r\nHost: {}\r\nCookie: {}\r\n\r\n",
+            d.addr,
+            c.cookie.clone().expect("cookie")
+        )
+        .as_bytes(),
+    )
+    .await
+    .expect("write");
+    let mut buf = [0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(5), sse.read(&mut buf))
+        .await
+        .expect("first snapshot in time")
+        .expect("read");
+    assert!(n > 0);
+    c.post("/api/logout", json!({}))
+        .await
+        .expect("logout")
+        .ok()
+        .expect("logged out");
+    // Nothing changes on the daemon from here on.
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(Duration::from_secs(8), async {
+        while !rest.ends_with(b"0\r\n\r\n") {
+            match sse.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => rest.extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the stream must end within a heartbeat");
 }
