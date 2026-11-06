@@ -93,6 +93,8 @@ pub enum SshError {
     AuthRejected {
         user: String,
         host: String,
+        /// What was refused, for the message.
+        with: &'static str,
     },
     Timeout {
         host: String,
@@ -126,8 +128,14 @@ impl fmt::Display for SshError {
                 pinned.join(", ")
             ),
             Self::KeyFile { path, reason } => write!(f, "key file {}: {reason}", path.display()),
-            Self::AuthRejected { user, host } => {
-                write!(f, "{host} rejected the key for user {user}")
+            Self::AuthRejected { user, host, with } => {
+                write!(f, "{host} rejected the {with} for user {user}")?;
+                if *with == "password" {
+                    f.write_str(
+                        " (a server that also asks for a one-time code ends the same way)",
+                    )?;
+                }
+                Ok(())
             }
             Self::Timeout { host, after } => write!(f, "{host}: no connection after {after:?}"),
             Self::Connect { host, reason } => write!(f, "{host}: {reason}"),
@@ -257,11 +265,7 @@ pub async fn connect(
                     )
                     .await
             }
-            Err(pw) => {
-                handle
-                    .authenticate_password(&target.user, pw.as_str())
-                    .await
-            }
+            Err(pw) => password_login(&mut handle, &target.user, pw.as_str()).await,
         };
         let auth = auth.map_err(|e| SshError::Connect {
             host: host.clone(),
@@ -271,6 +275,10 @@ pub async fn connect(
             return Err(SshError::AuthRejected {
                 user: target.user.clone(),
                 host: host.clone(),
+                with: match key {
+                    Ok(_) => "key",
+                    Err(_) => "password",
+                },
             });
         }
         Ok(handle)
@@ -284,6 +292,51 @@ pub async fn connect(
     Ok(SshConn {
         handle: Arc::new(handle),
         host: target.host.clone(),
+    })
+}
+
+/// Logs in with a password by the `password` method, then by `keyboard-interactive`, which is the
+/// only one some PAM setups offer. The password goes only to a single hidden prompt, so a second
+/// factor or a visible question ends in a plain rejection. Rounds are capped because a hostile
+/// server could otherwise keep asking until the connect timeout.
+async fn password_login<H: client::Handler>(
+    handle: &mut client::Handle<H>,
+    user: &str,
+    password: &str,
+) -> Result<client::AuthResult, russh::Error> {
+    let first = handle.authenticate_password(user, password).await?;
+    let client::AuthResult::Failure {
+        remaining_methods, ..
+    } = &first
+    else {
+        return Ok(first);
+    };
+    if !remaining_methods.contains(&russh::MethodKind::KeyboardInteractive) {
+        return Ok(first);
+    }
+    let mut reply = handle
+        .authenticate_keyboard_interactive_start(user, None)
+        .await?;
+    let mut sent = false;
+    for _ in 0..4 {
+        let client::KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } = &reply else {
+            break;
+        };
+        let answers = match prompts.as_slice() {
+            [] => Vec::new(),
+            [prompt] if !prompt.echo && !sent => {
+                sent = true;
+                vec![password.to_owned()]
+            }
+            _ => break,
+        };
+        reply = handle
+            .authenticate_keyboard_interactive_respond(answers)
+            .await?;
+    }
+    Ok(match reply {
+        client::KeyboardInteractiveAuthResponse::Success => client::AuthResult::Success,
+        _ => first,
     })
 }
 
@@ -303,12 +356,31 @@ fn load_key(path: &std::path::Path) -> Result<russh::keys::PrivateKey, SshError>
         )));
     }
     // The error text never includes key material, only what went wrong.
-    russh::keys::load_secret_key(path, None).map_err(|e| match e {
+    let key = russh::keys::load_secret_key(path, None).map_err(|e| match e {
         russh::keys::Error::KeyIsEncrypted => {
             err("passphrase-protected keys are not supported yet; use an unencrypted key".into())
         }
         other => err(other.to_string()),
-    })
+    })?;
+    // Without the rsa feature russh still loads an RSA key but signs with SHA-1, which OpenSSH
+    // refuses, so the user would only see "rejected the key".
+    if !matches!(
+        key.algorithm(),
+        Algorithm::Ed25519 | Algorithm::Ecdsa { .. }
+    ) {
+        return Err(err(format!(
+            "{} keys are not supported; create one with `ssh-keygen -t ed25519` and add it to the server",
+            key_type_name(&key.algorithm())
+        )));
+    }
+    Ok(key)
+}
+
+fn key_type_name(algorithm: &Algorithm) -> String {
+    match algorithm {
+        Algorithm::Rsa { .. } => "RSA".to_owned(),
+        other => other.to_string(),
+    }
 }
 
 /// Accepts the server's host key only if it is one of the pins; remembers what was offered otherwise.

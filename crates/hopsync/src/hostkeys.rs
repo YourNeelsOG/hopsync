@@ -423,6 +423,11 @@ pub async fn offered_key(host: &HostId) -> Result<PublicKey, HostKeyError> {
         (None, Err(_)) => Err(HostKeyError::Connect(format!(
             "{host}: timed out after {FETCH_TIMEOUT:?}"
         ))),
+        // russh offers only key types it can verify, and an RSA-only OpenSSH still answers with RSA.
+        (None, Ok(Err(russh::Error::WrongServerSig))) => Err(HostKeyError::Connect(format!(
+            "{host}: its host key could not be verified. Hopsync supports ed25519 and ECDSA host keys, \
+             so the usual cause is a server with only RSA host keys; ask its admin to add an ed25519 one"
+        ))),
         (None, Ok(Err(e))) => Err(HostKeyError::Connect(format!("{host}: {e}"))),
         (None, Ok(Ok(_))) => Err(HostKeyError::Connect(format!(
             "{host}: connected without a host key check"
