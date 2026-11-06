@@ -4,12 +4,16 @@
   "version": "0.0.0",
   "type": "module",
   "packageManager": "pnpm@10.34.7",
+  "engines": {
+    "pnpm": ">=10.34.7"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "e2e": "python3 e2e/e2e.py"
+    "e2e": "python3 e2e/e2e.py",
+    "e2e:password": "python3 e2e/password_install.py"
   },
   "dependencies": {
     "@fontsource-variable/inter": "5.3.0",
