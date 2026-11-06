@@ -104,9 +104,8 @@ Test: `daemon::tests::a_too_long_socket_path_says_what_to_do`.
 - **Throttle by address.** Many source addresses can each try 3 passwords freely before their
   delays start; with argon2id at about 50 ms per attempt and one at a time, that is at most about
   20 guesses a second in total. A strong password is still required (12 characters minimum).
-- **Password installs untested end to end.** The test sshd cannot accept password logins without
-  root (PAM). Key installation is tested with an existing key; password login uses russh's
-  `authenticate_password` and shares every other step.
+- **Password installs untested end to end.** Closed on 2026-11-06: see the
+  [logins and releases review](../phase4/security-review.md).
 - **Job history grows.** Items and events stay until their job is deleted. Pruning by age is a
   Phase 3 setting (UX study §3).
 - **No independent review yet.** See above.

@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="#performance">Performance</a> ·
-  <a href="#build-from-source">Build</a> ·
+  <a href="#install">Install</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#security">Security</a> ·
   <a href="#documentation">Documentation</a> ·
@@ -22,9 +22,8 @@
 </picture>
 
 > [!NOTE]
-> Hopsync is pre-release software. The transfer engine, daemon and web UI work and are tested, but
-> there are no release binaries yet and no independent security review. See
-> [Project status](#project-status).
+> Hopsync is early software. The transfer engine, daemon and web UI work and are tested, but there
+> has been no independent security review. See [Project status](#project-status).
 
 ## Why Hopsync
 
@@ -99,13 +98,43 @@ These results have limits:
 [Method and caveats](docs/phase1/benchmarks.md) · [Medians as JSON](docs/benchmarks/results.json) ·
 [Benchmark script](benches/bench.py) · [Chart script](benches/charts.py)
 
+## Install
+
+Download the archive for your machine from [Releases](https://github.com/YourNeelsOG/hopsync/releases):
+`x86_64`, `aarch64` or `armv7`. You do not need root.
+
+```bash
+curl -fLO https://github.com/YourNeelsOG/hopsync/releases/latest/download/hopsync-x86_64-linux.tar.gz
+```
+
+```bash
+tar -xzf hopsync-x86_64-linux.tar.gz
+```
+
+```bash
+mkdir -p ~/.local/bin && cp hopsync-x86_64-linux/hopsync ~/.local/bin/
+```
+
+The binary runs on Linux with glibc 2.17 or later, which covers CentOS 7 and every current Debian and
+Ubuntu. It has been run on CentOS 7, Debian 10 to 12 and Ubuntu 20.04 to 24.04, all on a recent
+kernel. It does not run on musl systems such as Alpine. Kernels older than 5.6 use a fallback to
+confine paths, and no release has been tested on one.
+
+To check a download, compare it with `sha256sums.txt` from the same release. Each archive also has a
+signed record of the build that made it, which the [GitHub CLI](https://cli.github.com) can verify:
+
+```bash
+gh attestation verify hopsync-x86_64-linux.tar.gz --repo YourNeelsOG/hopsync
+```
+
 ## Build from source
 
 You need these on the machine that builds:
 
 - Rust. `rust-toolchain.toml` pins the version.
-- Node.js 20.19 or later, or 22.12 or later, with [pnpm](https://pnpm.io). `packageManager` in
-  `package.json` pins the pnpm version.
+- Node.js 20.19 or later, or 22.12 or later, with [pnpm](https://pnpm.io) 10. pnpm 9 stops with an
+  error that names the version it needs. To use the pinned version without installing it, replace
+  `pnpm` with `npx pnpm@10.34.7`.
 
 ```bash
 cd crates/hopsync/web
@@ -117,7 +146,11 @@ HOPSYNC_REQUIRE_UI=1 cargo build --release
 
 The result is `target/release/hopsync`, about 20 MB, with the whole web UI compiled in. Copy that
 one file to your server. **The server does not need Node, npm or anything else from the build**, and
-the UI never loads anything from another site at runtime. Hopsync runs on Linux 5.6 or later.
+the UI never loads anything from another site at runtime.
+
+A plain `cargo build` links against the glibc of the machine that builds, so the binary may refuse to
+start on a server with an older one. [contrib/release/build.sh](contrib/release/build.sh) makes the
+release builds, which avoid this.
 
 If you build without the UI, the binary still works and its web page tells you how to add the UI.
 `HOPSYNC_REQUIRE_UI=1` turns that case into a build error.
@@ -143,7 +176,8 @@ one-time setup token, and the page asks for that token once to set the admin pas
 
 Then add a server under **Servers**. Compare the host key fingerprint with the one your provider
 shows, and confirm it. Hopsync can create a key for that server and install it with the account
-password once, so no password is stored.
+password once, so no password is stored. This works with servers that ask for the password by either
+SSH method, but not with servers that also ask for a one-time code.
 
 On **Transfers** you browse both sides, compare them, select files and folders, and copy them either
 way. Before anything is queued, a preview shows what would be new, replaced or skipped. No question
@@ -215,7 +249,8 @@ in front and use `--secure-cookies`.
 
 Every review so far was done by the people and tools that built the code, so none is independent.
 Read them here: [engine](docs/phase1/security-review.md), [daemon](docs/phase2/security-review.md),
-[web UI](docs/phase3/security-review.md), [React UI](docs/phase3/react-security-review.md).
+[web UI](docs/phase3/security-review.md), [React UI](docs/phase3/react-security-review.md),
+[logins and releases](docs/phase4/security-review.md).
 
 ## Project status
 
@@ -224,13 +259,18 @@ Read them here: [engine](docs/phase1/security-review.md), [daemon](docs/phase2/s
 | Transfer engine and CLI | Done |
 | Daemon, job queue and JSON API | Done |
 | Web UI | Done |
-| Built-in TLS, fuzzing, CI | Not started |
-| Release binaries and packages (`.deb`, AUR, Docker) | Not started |
+| CI and release binaries (x86_64, aarch64, armv7) | Done |
+| Built-in TLS, fuzzing | Not started |
+| Packages (`.deb`, AUR, Docker) | Not started |
 | Independent security review | Not started |
 | Comparison with `rsync`, `rclone` and `lftp`, and a 1 Gbps test | Not started |
 
 Known limits today:
 
+- SSH key files must be ed25519 or ECDSA, without a passphrase. RSA keys and passphrase-protected keys
+  are refused with a message that says so, and `ssh-agent` is not used. Keys that Hopsync creates
+  avoid all of this.
+- A server with only RSA host keys cannot be added. Most servers also have an ed25519 host key.
 - The queue shows a percentage and time left only for a single-file upload. Downloads and folders
   show speed and bytes so far.
 - A transfer runs between the box running Hopsync and one server. To copy between two other boxes,
@@ -258,6 +298,7 @@ pnpm dev         # UI with hot reload, proxied to a daemon on 127.0.0.1:7890
 pnpm test        # unit tests
 pnpm typecheck
 pnpm e2e         # browser test with a real daemon and sshd, needs Python playwright
+pnpm e2e:password  # password key install against OpenSSH in a container, needs Docker
 ```
 
 ## Contributing
