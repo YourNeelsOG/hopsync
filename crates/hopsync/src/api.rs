@@ -616,14 +616,14 @@ async fn job_events(State(st): State<AppState>, Path(id): Path<i64>) -> ApiResul
     Ok(Json(st.svc.store.job_events(id).map_err(ServiceError::from)?).into_response())
 }
 
-async fn pause_queue(State(st): State<AppState>) -> Response {
-    st.svc.pause_queue();
-    ok()
+async fn pause_queue(State(st): State<AppState>) -> ApiResult<Response> {
+    st.svc.pause_queue()?;
+    Ok(ok())
 }
 
-async fn resume_queue(State(st): State<AppState>) -> Response {
-    st.svc.resume_queue();
-    ok()
+async fn resume_queue(State(st): State<AppState>) -> ApiResult<Response> {
+    st.svc.resume_queue()?;
+    Ok(ok())
 }
 
 async fn events(

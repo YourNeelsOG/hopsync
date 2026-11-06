@@ -65,14 +65,19 @@ async fn a_claimed_size_of_exabytes_costs_no_memory() {
     )
     .expect("setrlimit");
     let Some(e) = env() else { return };
-    // Sparse: the remote "file" takes no space, but reports 4 EiB.
-    std::fs::File::create(e.remote_path("huge"))
+    // Sparse: the remote "file" takes no space, but reports 4 EiB. It lives on tmpfs because ext4
+    // refuses a file this large with EFBIG, and a smaller claim would not prove the point above.
+    let huge_dir = tempfile::tempdir_in("/dev/shm").expect("tempdir on tmpfs");
+    std::fs::File::create(huge_dir.path().join("huge"))
         .and_then(|f| f.set_len(1 << 62))
         .expect("sparse file");
+    let (_huge_pins, known, target) = e.sshd.client();
+    let root = RemoteRoot::parse(huge_dir.path().to_str().expect("utf8")).expect("remote root");
+    let remote = Remote::new(target, known, root);
     let err = tokio::time::timeout(
         Duration::from_secs(20),
         pull_file(
-            &e.remote,
+            &remote,
             &rel("huge"),
             &e.local,
             &rel("huge"),

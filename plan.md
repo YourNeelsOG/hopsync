@@ -1,6 +1,6 @@
 # Hopsync: Design & Plan
 
-**Status:** approved by owner 2026-11-03; Phases 0 and 1 done, Phase 2 done (2026-11-04), Phase 3 done (2026-11-04), web UI moved to React (2026-11-04, `docs/plans/2026-11-04-react-ui-plan.md`); Phase 4 not started
+**Status:** approved by owner 2026-11-03; Phases 0 and 1 done, Phase 2 done (2026-11-04), Phase 3 done (2026-11-04), web UI moved to React (2026-11-04, `docs/plans/2026-11-04-react-ui-plan.md`); Phase 4 started (2026-11-06: CI and release binaries done)
 **Language:** Rust
 **License:** MIT OR Apache-2.0
 **Rules:** every contributor and agent follows `CLAUDE.md` in this folder.
@@ -59,7 +59,8 @@ like FileZilla, it does not need Hopsync installed.
 ## 3. Constraints
 
 - **Shared seedboxes:** often no root, no system systemd, restricted ports, ARM or x86_64. Must run as a
-  normal user, from a single static binary, with `systemctl --user` or a plain `hopsync serve`.
+  normal user, from a single binary that needs only glibc 2.17 (Decision log 2026-11-06), with
+  `systemctl --user` or a plain `hopsync serve`.
 - **Remote side is plain OpenSSH (or Dropbear/Windows OpenSSH).** We control nothing there except what
   SFTP and its extensions allow.
 - **SSH server limits:** OpenSSH defaults `MaxSessions 10` and `MaxStartups 10:30:100`; providers may run
@@ -251,9 +252,11 @@ Notes and results: `docs/phase0/`.
 ### Phase 4: Hardening & packaging
 - Show a percentage and time left for downloads and folders. Today only a single-file upload has a
   total, because the daemon learns other totals only by asking the remote or walking the tree.
-- CI that runs the audits, tests and browser run, and builds releases with `HOPSYNC_REQUIRE_UI=1`.
+- Done 2026-11-06: CI that runs the audits, tests and browser run, and release builds with
+  `HOPSYNC_REQUIRE_UI=1`; binaries for x86_64, aarch64 and armv7; signed build records.
 - TLS, rate limiting, audit log, fuzzing of path/listing parsing, systemd sandboxing.
-- Static builds (x86_64, aarch64, armv7), AUR, `.deb`, Docker image, signed releases, docs, benchmark page.
+- AUR, `.deb`, Docker image, docs, benchmark page.
+- Passphrase-protected keys or `ssh-agent`, and RSA if users ask for it after the advisory below.
 
 ### Phase 5: v1.0 release
 
@@ -335,6 +338,14 @@ Notes and results: `docs/phase0/`.
 | 2026-11-04 | Default theme is dark, with a light theme a click away | An assumption, not an owner decision: the owner saw this direction and did not object, so it is easy to change. The choice lives in `localStorage` as a per-viewer convenience. |
 | 2026-11-04 | SSE sends a named `heartbeat` event every 5 s when idle and re-checks its session then; the UI reconnects after 15 s of silence | Keep-alive comments are invisible to `EventSource`, so a stalled stream looked like a healthy idle one. The browser test also found that on an idle daemon a revoked session's stream stayed open forever: the session was checked only when a snapshot changed. |
 | 2026-11-04 | `main` is production and only the owner can change it; new work reaches `dev` by pull request; enforced with repository rulesets | Owner choice: keep production stable while accepting outside work. Compared with classic branch protection, whose per-user push restrictions exist only for organization repositories. A ruleset can restrict updates to `main` and let only the repository admin role bypass. |
+| 2026-11-06 | Release binaries link against glibc 2.17 through `cargo-zigbuild`, not static musl (changes §3) | Measured on loopback tmpfs, 1 GiB, median of 3, same batch: native glibc 764 MB/s push and 1,200 pull; glibc target 804 and 1,176; musl 592 and 464, so musl loses 61 % on pull. The cause was not proved (no profiler here); musl's allocator is the usual suspect. A separate run, with other containers on the machine in both batches, gave glibc 2.17 832 and 1,337 against native 833 and 1,303. Musl plus `mimalloc` was not tried, because it adds a C dependency to solve a problem the glibc target does not have. glibc 2.17 ran on CentOS 7, Debian 10 to 12 and Ubuntu 20.04 to 24.04. Cost: no Alpine. Revisit if users ask. |
+| 2026-11-06 | Cross builds use `cargo-zigbuild` 0.24.1 with zig 0.17.1 | Compared with `cross`: its last release is 0.2.5 from February 2023 and it needs Docker for each target, while cargo-zigbuild had 1.9 M recent downloads and a release this week. It can pick the glibc version per target, which the Decision above needs. It runs only at build time and ships nothing. |
+| 2026-11-06 | Password login falls back to `keyboard-interactive`, and sends the password only to a single hidden prompt | A real OpenSSH with only that method refused the correct password. Prompts that are visible or come in pairs are not asking for just the account password, so they get a plain rejection and never see it. A pinned host gets the password either way, so this adds no exposure. Rounds are capped at 4. |
+| 2026-11-06 | RSA user keys are refused when loaded, with the `ssh-keygen` command in the message | Without the `rsa` feature russh still loads such a key but signs with SHA-1, which current OpenSSH refuses, and the user saw only "rejected the key". The 2026-11-03 decision against RSA stands. |
+| 2026-11-06 | Release builds are signed with GitHub build attestations (Sigstore), not minisign | No long-lived signing key to store, lose or leak; the record also names the workflow and commit that built the file. Cost: verifying needs the `gh` CLI or a Sigstore client, so `sha256sums.txt` ships too. Compared with minisign, which is simpler to verify but needs a private key held as a repository secret. |
+| 2026-11-06 | Actions pinned by commit hash; the job that builds has read-only access and the job that can write runs no repository code | A moved tag or a poisoned build script must not reach release publishing (CLAUDE.md §3). No dependency caches in the release job, for the same reason. |
+| 2026-11-06 | A held queue and a stop pressed on a running job are saved in the store (schema 2), and a restart honors both | Both lived only in memory, so a restart started a held queue, and a daemon that died in the moment after a pause or cancel ran that job again (found by a TLA+ model, then reproduced on the binary). The stop is a new column, not a new state: the job really is still running until the transfer reports back, and a transfer that ends first keeps its real result. Cost: a binary from before schema 2 refuses this database. |
+| 2026-11-06 | pnpm 9 is refused through `engines`, not supported | pnpm 9 ignores `minimumReleaseAge`, so letting it install would quietly drop the 14-day rule. `packages` in the workspace file exists so pnpm 9 reaches the `engines` check instead of a confusing parse error. Corepack is no help: Node 25 and later do not ship it. |
 
 ## 11. Open questions (owner to decide)
 
