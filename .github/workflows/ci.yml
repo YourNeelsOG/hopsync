@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Tests that need OpenSSH skip themselves without it, so its absence must fail here instead.
+      - name: Install OpenSSH server
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server
+          test -x /usr/sbin/sshd
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install audit tools
+        run: cargo install --locked cargo-audit@0.22.2 cargo-deny@0.20.2
+      - name: cargo audit
+        run: cargo audit
+      - name: cargo deny
+        run: cargo deny check
+
+  web:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: crates/hopsync/web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: pnpm 9 is told which version it needs
+        run: npx --yes pnpm@9.15.9 install --frozen-lockfile 2>&1 | grep 'Expected version'
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: crates/hopsync/web/package.json
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm audit
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+
+  browser:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: crates/hopsync/web/package.json
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Install OpenSSH server and the browser
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server
+          pip install playwright==1.60.0
+          playwright install --with-deps chromium
+      - name: Build the UI
+        working-directory: crates/hopsync/web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - name: Build the binary with the UI required
+        run: cargo build --release --locked -p hopsync
+        env:
+          HOPSYNC_REQUIRE_UI: "1"
+      - name: Browser test
+        working-directory: crates/hopsync/web
+        run: pnpm e2e
+      - name: Password install against OpenSSH in a container
+        working-directory: crates/hopsync/web
+        run: pnpm e2e:password
