@@ -140,6 +140,8 @@ const MIGRATIONS: &[&str] = &[
          event TEXT NOT NULL,
          detail TEXT NOT NULL
      );",
+    // 2: a stop pressed on a running job, kept until the job reports that it stopped.
+    "ALTER TABLE jobs ADD COLUMN stop_wanted TEXT CHECK (stop_wanted IN ('paused', 'cancelled'));",
 ];
 
 pub fn now() -> i64 {
@@ -669,7 +671,7 @@ impl Store {
     pub fn set_job_state(&self, id: i64, state: JobState, error: Option<&str>) -> Result<()> {
         let t = now();
         let n = self.lock().execute(
-            "UPDATE jobs SET state = ?2, error = ?3,
+            "UPDATE jobs SET state = ?2, error = ?3, stop_wanted = NULL,
                started = CASE WHEN ?2 = 'running' THEN ?4 ELSE started END,
                finished = CASE WHEN ?2 IN ('done', 'failed', 'cancelled') THEN ?4 ELSE NULL END
              WHERE id = ?1",
@@ -734,12 +736,40 @@ impl Store {
         Ok(())
     }
 
-    /// Jobs left running by a daemon that stopped: back to the queue, to resume from the journal.
+    /// Records that the user asked a running job to stop, so a daemon that dies before the
+    /// transfer has stopped still ends the job that way. `set_job_state` clears it.
+    pub fn want_job_stop(&self, id: i64, state: JobState) -> Result<()> {
+        self.lock().execute(
+            "UPDATE jobs SET stop_wanted = ?2 WHERE id = ?1 AND state = 'running'",
+            params![id, state.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Jobs left running by a daemon that stopped. One the user asked to stop ends as asked; the
+    /// others go back to the queue, to resume from the journal. Returns how many were requeued.
     pub fn requeue_running(&self) -> Result<usize> {
-        Ok(self.lock().execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let t = now();
+        tx.execute(
+            "INSERT INTO job_events (job, at, text)
+             SELECT id, ?1, stop_wanted FROM jobs
+             WHERE state = 'running' AND stop_wanted IS NOT NULL",
+            [t],
+        )?;
+        tx.execute(
+            "UPDATE jobs SET state = stop_wanted, stop_wanted = NULL,
+               finished = CASE WHEN stop_wanted = 'cancelled' THEN ?1 ELSE NULL END
+             WHERE state = 'running' AND stop_wanted IS NOT NULL",
+            [t],
+        )?;
+        let requeued = tx.execute(
             "UPDATE jobs SET state = 'queued', started = NULL WHERE state = 'running'",
             [],
-        )?)
+        )?;
+        tx.commit()?;
+        Ok(requeued)
     }
 
     /// Starts a job's run: forgets the items of any earlier run.
@@ -970,13 +1000,13 @@ mod tests {
     #[test]
     fn a_new_database_is_private_and_at_the_latest_schema() {
         let (dir, store) = open();
-        assert_eq!(store.schema_version().expect("version"), 1);
+        assert_eq!(store.schema_version().expect("version"), 2);
         let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
         assert_eq!(mode(&dir.path().join("data")), 0o700);
         assert_eq!(mode(&dir.path().join("data/hopsync.db")), 0o600);
         drop(store);
         let again = Store::open(&dir.path().join("data/hopsync.db")).expect("reopen");
-        assert_eq!(again.schema_version().expect("version"), 1);
+        assert_eq!(again.schema_version().expect("version"), 2);
     }
 
     #[test]
@@ -995,7 +1025,7 @@ mod tests {
                 err,
                 StoreError::TooNew {
                     found: 99,
-                    known: 1
+                    known: 2
                 }
             ),
             "got {err}"
@@ -1142,6 +1172,71 @@ mod tests {
         assert_eq!(store.prune_sessions(0, now() + 50).expect("prune"), 1);
         assert!(store.session(b"a").expect("a").is_none());
         assert!(store.session(b"b").expect("b").is_some());
+    }
+
+    #[test]
+    fn a_stop_request_outlives_the_daemon_only_while_the_job_runs() {
+        let (_dir, store) = open();
+        let s = store.add_server(&spec("a")).expect("add").id;
+        let stopped = store.add_job(&job(s, "stopped")).expect("job").id;
+        let finished = store.add_job(&job(s, "finished")).expect("job").id;
+        let waiting = store.add_job(&job(s, "waiting")).expect("job").id;
+        let running = store.add_job(&job(s, "running")).expect("job").id;
+        for id in [stopped, finished, running] {
+            store
+                .set_job_state(id, JobState::Running, None)
+                .expect("run");
+        }
+        store
+            .want_job_stop(stopped, JobState::Paused)
+            .expect("stop");
+        store
+            .want_job_stop(finished, JobState::Cancelled)
+            .expect("stop");
+        store
+            .want_job_stop(waiting, JobState::Paused)
+            .expect("ignored: it is not running");
+        // The transfer ended on its own before it noticed the stop.
+        store
+            .set_job_state(finished, JobState::Done, None)
+            .expect("done");
+
+        assert_eq!(store.requeue_running().expect("requeue"), 1);
+        let state = |id| store.job(id).expect("job").state;
+        assert_eq!(state(stopped), JobState::Paused);
+        assert_eq!(state(finished), JobState::Done);
+        assert_eq!(state(waiting), JobState::Queued);
+        assert_eq!(state(running), JobState::Queued);
+
+        // Used up: a later run of the same job is not stopped by the old request.
+        store
+            .set_job_state(stopped, JobState::Running, None)
+            .expect("run again");
+        assert_eq!(store.requeue_running().expect("requeue"), 1);
+        assert_eq!(state(stopped), JobState::Queued);
+    }
+
+    #[test]
+    fn a_database_from_before_stop_requests_keeps_its_jobs() {
+        let (dir, store) = open();
+        let s = store.add_server(&spec("a")).expect("add").id;
+        let id = store.add_job(&job(s, "kept")).expect("job").id;
+        store
+            .set_job_state(id, JobState::Running, None)
+            .expect("run");
+        {
+            let conn = store.lock();
+            conn.execute_batch(
+                "ALTER TABLE jobs DROP COLUMN stop_wanted; PRAGMA user_version = 1;",
+            )
+            .expect("back to schema 1");
+        }
+        drop(store);
+
+        let store = Store::open(&dir.path().join("data/hopsync.db")).expect("upgrade");
+        assert_eq!(store.schema_version().expect("version"), 2);
+        assert_eq!(store.requeue_running().expect("requeue"), 1);
+        assert_eq!(store.job(id).expect("job").state, JobState::Queued);
     }
 
     #[test]

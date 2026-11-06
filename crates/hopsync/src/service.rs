@@ -10,7 +10,7 @@
 //! - The scheduler runs queued jobs in queue order, `concurrency` at a time. Pause and cancel
 //!   stop a running transfer through the engine's cancel signal, which keeps part files and the
 //!   journal, so a paused or restarted job resumes. A daemon restart puts running jobs back in
-//!   the queue.
+//!   the queue, except one you asked to stop, which ends as you asked. A held queue stays held.
 //! - Progress is one shared snapshot behind a `watch` channel, refreshed twice a second: any
 //!   number of watchers cost the same, and a slow one only skips snapshots.
 
@@ -45,6 +45,8 @@ use crate::vault::{Vault, VaultError};
 const KEY_PURPOSE: &str = "ssh-key";
 const SNAPSHOT_EVERY: Duration = Duration::from_millis(500);
 const FLUSH_EVERY: Duration = Duration::from_secs(1);
+/// Store setting: "true" while the user holds the queue. Not part of the settings API.
+const QUEUE_HELD: &str = "queue_held";
 /// Items a dry run returns; the counts cover everything.
 pub const DRY_RUN_ITEMS: usize = 10_000;
 pub const MAX_LANES: u32 = 64;
@@ -398,6 +400,7 @@ impl Service {
             Journal::open(&config.data_dir.join("journal.sqlite"))
                 .map_err(|e| ServiceError::Internal(e.to_string()))?,
         );
+        let queue_held = store.setting(QUEUE_HELD)?.as_deref() == Some("true");
         let requeued = store.requeue_running()?;
         if requeued > 0 {
             store.audit("restart", &format!("{requeued} running jobs requeued"))?;
@@ -418,7 +421,7 @@ impl Service {
             concurrency: config.concurrency.max(1),
             ssh: config.ssh,
             running: Mutex::new(HashMap::new()),
-            queue_paused: AtomicBool::new(false),
+            queue_paused: AtomicBool::new(queue_held),
             wake: Arc::new(Notify::new()),
             changes: AtomicU64::new(0),
             snapshot: watch::channel(Arc::new(Snapshot::default())).0,
@@ -1227,24 +1230,22 @@ impl Service {
         }
     }
 
-    /// Stops a running job as `state` (paused or cancelled); false if it was not running.
-    fn stop_running(&self, id: i64, state: JobState) -> bool {
-        let running = lock(&self.running).get(&id).cloned();
-        match running {
-            Some(r) => {
-                *lock(&r.stop) = Some(state);
-                r.cancel.send_replace(true);
-                true
-            }
-            None => false,
+    /// Stops a running job as `state` (paused or cancelled). Saved first, so that a daemon that
+    /// dies before the transfer has stopped cannot run the job again after its restart.
+    fn stop_running(&self, id: i64, state: JobState) -> Result<()> {
+        self.store.want_job_stop(id, state)?;
+        if let Some(r) = lock(&self.running).get(&id).cloned() {
+            *lock(&r.stop) = Some(state);
+            r.cancel.send_replace(true);
         }
+        Ok(())
     }
 
     pub fn pause_job(&self, id: i64) -> Result<()> {
         let job = self.store.job(id)?;
         match job.state {
             JobState::Running => {
-                self.stop_running(id, JobState::Paused);
+                self.stop_running(id, JobState::Paused)?;
             }
             JobState::Queued => {
                 self.store.set_job_state(id, JobState::Paused, None)?;
@@ -1261,7 +1262,7 @@ impl Service {
         let job = self.store.job(id)?;
         match job.state {
             JobState::Running => {
-                self.stop_running(id, JobState::Cancelled);
+                self.stop_running(id, JobState::Cancelled)?;
             }
             JobState::Queued | JobState::Paused => {
                 self.store.set_job_state(id, JobState::Cancelled, None)?;
@@ -1317,16 +1318,20 @@ impl Service {
         Ok(())
     }
 
-    /// Stops starting new jobs; running ones finish.
-    pub fn pause_queue(&self) {
+    /// Stops starting new jobs, also after a restart; running ones finish.
+    pub fn pause_queue(&self) -> Result<()> {
+        self.store.set_setting(QUEUE_HELD, "true")?;
         self.queue_paused.store(true, Ordering::Relaxed);
         self.changed();
+        Ok(())
     }
 
-    pub fn resume_queue(&self) {
+    pub fn resume_queue(&self) -> Result<()> {
+        self.store.set_setting(QUEUE_HELD, "false")?;
         self.queue_paused.store(false, Ordering::Relaxed);
         self.changed();
         self.wake.notify_one();
+        Ok(())
     }
 
     pub fn queue_paused(&self) -> bool {
