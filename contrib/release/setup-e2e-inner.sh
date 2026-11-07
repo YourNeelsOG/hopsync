@@ -15,6 +15,22 @@ login() {
 }
 needs_setup() { curl -s "http://127.0.0.1:$1/api/health" | grep -q '"setup_required":true'; }
 
+# The web UI on this box's own address, the way a browser elsewhere reaches it. The container's
+# eth0 address stands in for the public one; curl -k is the browser's accepted warning.
+public_checks() {
+    local port=$1 who=$2 ip fp
+    ip=$(hostname -I | awk '{print $1}')
+    [ "$(curl -sk -o /dev/null -w '%{http_code}' "https://$ip:$port/api/health")" = 200 ] && ok "$who: https on the box's address works" || bad "$who: no https on $ip:$port"
+    fp=$(curl -skv "https://$ip:$port/api/health" 2>&1 | grep -ci 'TLSv1.3')
+    [ "$fp" -gt 0 ] && ok "$who: it uses TLS 1.3" || bad "$who: not TLS 1.3"
+    code=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "http://$ip:$port/")
+    [ "$code" = "301 https://$ip:$port/" ] && ok "$who: http from elsewhere goes to https" || bad "$who: http reply: $code"
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/api/health")" = 200 ] && ok "$who: tunnels still work" || bad "$who: loopback http failed"
+    c=$(curl -sk -D - -o /dev/null -H "Origin: https://$ip:$port" -H 'Content-Type: application/json' -d "{\"password\":\"$PW\"}" "https://$ip:$port/api/login")
+    echo "$c" | grep -qi '^set-cookie:.*secure' && ok "$who: the login cookie is Secure" || bad "$who: cookie: $c"
+    echo "$c" | grep -qi 'strict-transport' && bad "$who: HSTS would forbid accepting the certificate" || ok "$who: no HSTS"
+}
+
 root_systemd() {
     cp "$SRC" /tmp/hopsync-copy && chmod +x /tmp/hopsync-copy
     H=/tmp/hopsync-copy
@@ -81,6 +97,24 @@ root_systemd() {
     check "uninstall kept the data" "test -e /var/lib/hopsync/data"
     check "uninstall kept the transfer folder" "test -d /home/alice/media"
     echo "$out" | grep -q '/var/lib/hopsync' && ok "uninstall says where the data stayed" || bad "no data path: $out"
+
+    out=$(printf '%s\n' "$PW" | $H setup --plain --password-stdin --public --folder /srv/hopsync 2>&1); rc=$?
+    [ "$rc" -eq 0 ] && ok "setup --public works" || bad "setup --public: $out"
+    echo "$out" | grep -q 'https://' && ok "it prints the https address" || bad "no https address: $out"
+    fp=$(openssl x509 -in /var/lib/hopsync/data/tls-cert.pem -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+    [ -n "$fp" ] && echo "$out" | tr -d '\n ' | grep -qF "$fp" && ok "it prints the certificate's real fingerprint" || bad "fingerprint $fp not in: $out"
+    check "the key is private" "test \$(stat -c %a /var/lib/hopsync/data/tls-key.pem) = 600 && test \$(stat -c %U /var/lib/hopsync/data/tls-key.pem) = hopsync"
+    public_checks 7890 system
+    journalctl -u hopsync --no-pager | grep -q 'PRIVATE KEY' && bad "key in the journal" || ok "key not in the journal"
+    before=$(cat /var/lib/hopsync/data/tls-cert.pem | sha256sum)
+    systemctl restart hopsync; sleep 1
+    [ "$before" = "$(cat /var/lib/hopsync/data/tls-cert.pem | sha256sum)" ] && ok "a restart keeps the certificate" || bad "certificate changed on restart"
+    out=$($H setup --plain --password-stdin </dev/null 2>&1)
+    grep -q -- '--tls' /etc/systemd/system/hopsync.service && ok "setup again stays public" || bad "second setup went local: $out"
+    out=$($H setup --plain --password-stdin --local-only </dev/null 2>&1)
+    ! grep -q -- '--tls' /etc/systemd/system/hopsync.service && curl -sk -m 3 -o /dev/null "https://$(hostname -I | awk '{print $1}'):7890/" ; [ $? -ne 0 ] && ok "--local-only closes it again" || bad "--local-only: $out"
+    $H setup --plain --password-stdin --local-only --tls-cert /x --tls-key /y </dev/null >/dev/null 2>&1 && bad "accepted --local-only with a certificate" || ok "--local-only and a certificate conflict"
+    $H uninstall --plain --yes >/dev/null 2>&1
 
     printf '[Service]\nExecStart=/bin/true\n' >/etc/systemd/system/hopsync.service
     out=$(printf '%s\n' "$PW" | $H setup --plain --password-stdin 2>&1); rc=$?
@@ -156,6 +190,10 @@ shared_box() {
     [ "$pid" = "$(pgrep -u carol -x hopsync)" ] && ok "a second setup does not restart it" || bad "second setup restarted it"
     [ "$(as_carol crontab -l | grep -c '@reboot.*hopsync start')" = 1 ] && ok "cron has one line after two setups" || bad "duplicate cron line"
 
+    out=$(as_carol hopsync setup --plain --password-stdin --public </dev/null 2>&1); rc=$?
+    [ "$rc" -eq 0 ] && ok "a shared box can go public" || bad "shared box --public: $out"
+    public_checks "$port" background
+    check "status shows the https address" "as_carol hopsync status | grep -q 'https://'"
     check "hopsync stop says so" "as_carol hopsync stop | grep -q 'hopsync: stopped'"
     check "hopsync stop works" "! pgrep -u carol -x hopsync"
     check "hopsync status says stopped" "as_carol hopsync status | grep -qi stopped"

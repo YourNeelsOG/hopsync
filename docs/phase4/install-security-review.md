@@ -37,6 +37,41 @@ it before a public release.
 | A tampered or cut-off download installs nothing | Holds | Checked end to end. The script's body runs only from its last line. |
 | The installer stays on HTTPS | Holds for curl and wget | `--proto =https --tlsv1.2` and `--https-only` unless a mirror was set by the user. |
 
+## Public HTTPS (2026-11-07)
+
+Scope: `crates/hopsync/src/tls.rs`, the listener wiring in `daemon.rs`, and `--public` in setup. Same
+reviewer, so also not independent.
+
+| Claim | Result | Evidence |
+|---|---|---|
+| Nothing becomes public unasked | Holds | Only `--public`, `--tls-cert` or a yes on a terminal opens it. Scripts that say nothing stay on loopback. Unit tested and checked end to end. |
+| A bad certificate never falls back to plain HTTP | Holds | The daemon loads it before binding and stops on error. `tests/tls.rs` tries a missing file, a certificate given as the key, and a key from another certificate. |
+| The private key stays private | Holds | Written 0600 from creation, in a 0700 data folder, owned by the service account. Not logged. Checked end to end. |
+| Passwords never cross the network in plain text | Holds | Plain HTTP from another machine gets only a redirect or a 400, before any routing. Setup's own password call stays on loopback. |
+| The redirect cannot be steered | Holds | `Host` must be letters, digits and `.-:[]`, so a request cannot add a header or a path. It can only name the host the browser already asked for. Unit tested. |
+| One client cannot stop the others | Holds | Each connection has its own task and a 10 s limit for the first byte and for the handshake. Tested with stalled connections. |
+| One address cannot use up the connections | Holds | 32 per address, 1024 in all. Tested, including that a slot comes back. |
+| Session cookies stay on HTTPS | Holds | `Secure` is set whenever TLS is on. Tested against the whole daemon. |
+| The login throttle still sees each client | Holds | The listener's peer address reaches handlers. Tested. |
+| TLS is current | Holds | TLS 1.3 only, on the `aws-lc-rs` already in the tree. `cargo audit` and `cargo deny` pass. |
+
+Accepted risks of public mode:
+
+- **The first visit is only as safe as the fingerprint check.** A person who clicks through the
+  warning without comparing can be intercepted. Nothing can prevent this with a self-signed
+  certificate on a bare IP; `--tls-cert` with a real domain removes it.
+- **The login page faces the internet.** The password has at least 12 characters and is hashed with
+  argon2id, and failures are throttled per address. A botnet using many addresses is throttled less,
+  and is slowed by one hash at a time. A firewall allow-list is the stronger answer where possible.
+- **The setup token is exposed to the network for a moment.** Between the daemon starting and setup
+  setting the password, `/api/setup` is reachable, but it needs the 0600 token, which never leaves
+  the box.
+- **Plain HTTP from loopback is served.** Another account on a shared box can reach the login page
+  that way. It could already reach the port, and it still needs the password. Loopback traffic is
+  not visible to other accounts without root.
+- **A slow distributed flood can reach the 1024 total.** That belongs to a firewall.
+- **IPv6 is not served** in public mode.
+
 ## Accepted risks
 
 - **`curl | sh` trusts the release host.** The checksum list comes from the same place as the archive,
@@ -46,7 +81,7 @@ it before a public release.
   the port, so another process cannot take it unless the daemon dies in the instant between the check
   and the request. The token is one-time and the password would be lost only in that case. On a
   shared box, loopback ports are visible to other customers in any case, and the UI requires a login.
-- **The tunnel and web UI are plain HTTP on loopback.** This is unchanged: there is no built-in TLS.
+- **The tunnel is plain HTTP on loopback.** SSH encrypts it across the network.
 - **When a folder's owner runs the service, that account can read the sealed store and its key.**
   Setup does this only when the owner already holds the files, and root chooses it by naming the
   folder. Choosing a new folder keeps the dedicated account.

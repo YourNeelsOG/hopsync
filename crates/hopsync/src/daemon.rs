@@ -26,6 +26,8 @@ pub struct DaemonConfig {
     pub service: ServiceConfig,
     /// Set when a TLS proxy terminates HTTPS in front of the daemon.
     pub secure_cookies: bool,
+    /// Serve HTTPS directly.
+    pub tls: Option<crate::tls::Source>,
 }
 
 /// `$XDG_RUNTIME_DIR/hopsync/hopsync.sock`, else `<data dir>/run/hopsync.sock`.
@@ -155,12 +157,27 @@ async fn shutdown_signal() {
 pub async fn run(cfg: DaemonConfig) -> Result<(), String> {
     // The service takes the data directory's lock first; nothing is bound before that.
     let svc = Service::open(cfg.service).map_err(|e| e.to_string())?;
+    // A bad certificate stops the daemon here, so it never falls back to plain HTTP.
+    let tls = cfg.tls.as_ref().map(crate::tls::load).transpose()?;
+    if let Some(t) = &tls {
+        eprintln!("hopsync: HTTPS certificate SHA-256 {}", t.fingerprint);
+    }
+    let tls = tls.map(|t| t.server);
     let sock = bind_socket(&cfg.socket).await?;
     let tcp = TcpListener::bind(cfg.listen)
         .await
         .map_err(|e| format!("listen on {}: {e}", cfg.listen))?;
     let local = tcp.local_addr().map_err(|e| e.to_string())?;
-    serve(svc, tcp, sock, cfg.secure_cookies, shutdown_signal(), local).await?;
+    serve(
+        svc,
+        tcp,
+        sock,
+        cfg.secure_cookies,
+        tls,
+        shutdown_signal(),
+        local,
+    )
+    .await?;
     let _ = std::fs::remove_file(&cfg.socket);
     Ok(())
 }
@@ -171,11 +188,14 @@ pub async fn serve(
     tcp: TcpListener,
     sock: OwnerOnly,
     secure_cookies: bool,
+    tls: Option<Arc<rustls::ServerConfig>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
     shown: SocketAddr,
 ) -> Result<(), String> {
     svc.start();
-    eprintln!("hopsync: web UI and API on http://{shown}/");
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    let secure_cookies = secure_cookies || tls.is_some();
+    eprintln!("hopsync: web UI and API on {scheme}://{shown}/");
     if !shown.ip().is_loopback() && !secure_cookies {
         eprintln!(
             "hopsync: WARNING: serving plain HTTP on {shown}, which is not a loopback address. \
@@ -186,7 +206,7 @@ pub async fn serve(
     if svc.auth.needs_setup() {
         // The token itself never goes to the log (CLAUDE.md §3).
         eprintln!(
-            "hopsync: first start: open http://{shown}/ and set the admin password with the setup token in {}",
+            "hopsync: first start: open {scheme}://{shown}/ and set the admin password with the setup token in {}",
             svc.setup_token_file().display()
         );
     }
@@ -220,9 +240,21 @@ pub async fn serve(
             loopback_only: shown.ip().is_loopback(),
         },
     );
-    let server = axum::serve(tcp, net.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown)
-        .into_future();
+    let server = async move {
+        match tls {
+            Some(tls) => {
+                let app = crate::tls::with_peer(net)
+                    .into_make_service_with_connect_info::<crate::tls::Peer>();
+                axum::serve(crate::tls::TlsListener::new(tcp, tls), app)
+                    .with_graceful_shutdown(shutdown)
+                    .await
+            }
+            None => {
+                let app = net.into_make_service_with_connect_info::<SocketAddr>();
+                axum::serve(tcp, app).with_graceful_shutdown(shutdown).await
+            }
+        }
+    };
     let deadline = async {
         svc.stopping().await;
         tokio::time::sleep(SHUTDOWN_GRACE).await;

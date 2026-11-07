@@ -123,15 +123,34 @@ To install an older release, set its tag. Every release stays available on the
 curl -fsSL https://github.com/YourNeelsOG/hopsync/releases/latest/download/install.sh | HOPSYNC_VERSION=v1.0.0 sh
 ```
 
-Setup prints the command that opens the web UI from your own PC. The web UI listens only on
-`127.0.0.1` of the server, so `http://<server-ip>:7890` is refused on purpose: it has no TLS, and
-the connection would carry your password in plain text. Open it through the SSH tunnel:
+Setup asks whether to open the web UI on the server's own address. If you say yes, it serves HTTPS at
+`https://<server-ip>:7890` and prints the address. Plain `http://<server-ip>:7890` redirects there.
+
+Your browser warns on the first visit, because the certificate is one the box made for itself and no
+public authority vouches for a bare IP address. Compare the SHA-256 fingerprint in the warning with
+the one setup printed, and accept it only if they match. If they differ, something is intercepting the
+connection, so do not type your password. The daemon also writes the fingerprint to its log.
+
+If you have a domain, use your own certificate instead, and browsers will not warn:
+
+```bash
+hopsync setup --tls-cert /path/to/fullchain.pem --tls-key /path/to/privkey.pem
+```
+
+The service account must be able to read both files, and a renewed certificate needs
+`hopsync restart`.
+
+If the page does not load, check the firewall first. Setup warns about `ufw`, but it cannot see a
+firewall run by your provider, which you may need to open for that port.
+
+To keep the web UI off the network, answer no, or run `hopsync setup --local-only`. It then listens
+only on `127.0.0.1`, and you reach it through an SSH tunnel:
 
 ```bash
 ssh -N -L 7890:127.0.0.1:7890 user@your-server
 ```
 
-Then go to `http://127.0.0.1:7890`.
+Then go to `http://127.0.0.1:7890`. The tunnel works in public mode too.
 
 Setup asks which folder Hopsync may use. It refuses a home folder, because writing to `~/.ssh` or
 `~/.bashrc` would let a web UI login run commands. Choose a subfolder such as `~/downloads`.

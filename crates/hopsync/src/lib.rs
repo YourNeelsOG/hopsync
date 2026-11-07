@@ -18,6 +18,7 @@ pub mod setup;
 pub mod sftp;
 pub mod ssh;
 pub mod store;
+pub mod tls;
 pub mod tune;
 pub mod ui;
 pub mod vault;
