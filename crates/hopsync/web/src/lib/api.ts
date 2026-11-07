@@ -146,12 +146,17 @@ function errorText(data: unknown): string | null {
  * One request. The `T` is trusted, not checked: the only peer is the daemon that served this page
  * (same origin, CSP), and these types mirror its structs.
  */
-/** Sends a file from this computer to `path` under the box's root. XHR, because fetch reports no upload progress. */
-export function uploadFile(path: string, file: File, overwrite: boolean, onProgress: (sent: number) => void): Promise<void> {
+/** The file route of this box (`server` null) or a connected server. */
+export function fileRoute(server: number | null): string {
+  return server === null ? "/api/local/file" : `/api/servers/${server}/file`;
+}
+
+/** Sends a file from this computer to `path` under a root folder. XHR, because fetch reports no upload progress. */
+export function uploadFile(server: number | null, path: string, file: File, overwrite: boolean, onProgress: (sent: number) => void): Promise<void> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const query = new URLSearchParams({ path, overwrite: String(overwrite) });
-    xhr.open("PUT", `/api/local/file?${query.toString()}`);
+    xhr.open("PUT", `${fileRoute(server)}?${query.toString()}`);
     xhr.setRequestHeader("Content-Type", "application/octet-stream");
     xhr.upload.onprogress = (ev) => onProgress(ev.loaded);
     xhr.onerror = () => reject(new ApiError(0, "Hopsync is not reachable. Is the daemon running?"));

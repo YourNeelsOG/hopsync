@@ -1022,3 +1022,36 @@ async fn a_cut_upload_leaves_nothing_behind() {
     }
     assert!(!d.local.path().join("cut.bin").exists());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_file_route_keeps_the_same_guards() {
+    let d = daemon().await;
+    let c = logged_in(&d).await;
+    let cookie = c.cookie.clone().expect("cookie");
+    let origin = format!("http://{}", d.addr);
+    let put = |cookie: &str, ctype: &str, origin: &str| {
+        format!(
+            "PUT /api/servers/1/file?path=x HTTP/1.1\r\nHost: {a}\r\nOrigin: {origin}\r\nCookie: {cookie}\r\nContent-Type: {ctype}\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+            a = d.addr
+        )
+    };
+    let bin = "application/octet-stream";
+    assert_eq!(raw(d.addr, &put("none=1", bin, &origin)).await.0, 401);
+    assert_eq!(
+        raw(d.addr, &put(&cookie, bin, "https://evil.example"))
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        raw(d.addr, &put(&cookie, "text/plain", &origin)).await.0,
+        415
+    );
+    // Passes the guards; there is simply no such server.
+    assert_eq!(raw(d.addr, &put(&cookie, bin, &origin)).await.0, 404);
+    let get = format!(
+        "GET /api/servers/1/file?path=x HTTP/1.1\r\nHost: {a}\r\nConnection: close\r\n\r\n",
+        a = d.addr
+    );
+    assert_eq!(raw(d.addr, &get).await.0, 401);
+}

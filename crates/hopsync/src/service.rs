@@ -36,7 +36,7 @@ use crate::journal::Journal;
 use crate::localio::{CachePolicy, LocalReader, LocalWriter};
 use crate::paths::{EntryKind, Hidden, LocalRoot, Name, OpenMode, RelPath, RemoteRoot};
 use crate::policy::Existing;
-use crate::sftp::{RemoteKind, SftpError};
+use crate::sftp::{RemoteKind, RemoteOpenMode, SftpError};
 use crate::ssh::{KeySource, SshError, SshOptions, SshTarget};
 use crate::store::{
     Direction, Job, JobItem, JobSpec, JobState, Server, ServerSpec, Store, StoreError,
@@ -141,6 +141,64 @@ impl Drop for Upload<'_> {
             // After a finished upload the part file is already gone, which is not an error.
             let _ = local.remove_file(&self.part);
         }
+    }
+}
+
+/// A file on a server, opened for a browser to save.
+pub struct RemoteDownload {
+    pub file: Arc<crate::sftp::RemoteFile>,
+    pub size: u64,
+    pub name: String,
+}
+
+/// An upload's block size to a server, and how many may be on their way at once.
+const REMOTE_BLOCK: usize = 256 << 10;
+const REMOTE_BLOCKS_OUT: usize = 16;
+
+/// Waits for one block to reach the server.
+async fn finished_block(
+    out: &mut tokio::task::JoinSet<std::result::Result<(), SftpError>>,
+) -> Result<()> {
+    match out.join_next().await {
+        Some(Ok(r)) => r.map_err(sftp_error),
+        Some(Err(e)) => Err(ServiceError::Internal(e.to_string())),
+        None => Ok(()),
+    }
+}
+
+/// One running upload to a server: frees its destination and removes its part file however it
+/// ends. The removal needs the network, so it runs on its own after the request has gone.
+struct RemoteUpload<'a> {
+    uploads: &'a Mutex<std::collections::HashSet<String>>,
+    key: String,
+    cleanup: Option<(crate::sftp::Sftp, String)>,
+}
+
+impl Drop for RemoteUpload<'_> {
+    fn drop(&mut self) {
+        lock(self.uploads).remove(&self.key);
+        if let (Some((sftp, part)), Ok(rt)) =
+            (self.cleanup.take(), tokio::runtime::Handle::try_current())
+        {
+            rt.spawn(async move {
+                let _ = sftp.remove(&part).await;
+            });
+        }
+    }
+}
+
+/// `rel` under a server's root folder.
+fn remote_path(s: &Server, rel: &RelPath) -> Result<String> {
+    Ok(RemoteRoot::parse(&s.root)
+        .map_err(|e| bad(format!("root folder: {e}")))?
+        .join(rel))
+}
+
+/// A server's refusal, in the terms the API answers with.
+fn sftp_error(e: SftpError) -> ServiceError {
+    match e {
+        SftpError::NotFound(_) => ServiceError::NotFound,
+        e => ServiceError::Transfer(e.into()),
     }
 }
 
@@ -1095,6 +1153,157 @@ impl Service {
         .map_err(|e| ServiceError::Internal(e.to_string()))?
         .map_err(local_error)?;
         self.store.audit("upload", path)?;
+        Ok(total)
+    }
+
+    /// Opens a file on a server for a browser to save.
+    pub async fn open_remote_download(&self, server: i64, path: &str) -> Result<RemoteDownload> {
+        let rel = parse_rel(path)?;
+        let name = rel
+            .components()
+            .last()
+            .ok_or_else(|| bad("name a file"))?
+            .as_str()
+            .to_owned();
+        let s = self.store.server(server)?;
+        let full = remote_path(&s, &rel)?;
+        let sftp = self.remote(&s)?.session(&self.base_opts()).await?;
+        let attrs = sftp.lstat(&full).await.map_err(sftp_error)?;
+        // A symlink could lead out of the server's root folder.
+        if attrs.kind != RemoteKind::File {
+            return Err(bad("only files can be saved"));
+        }
+        let file = sftp
+            .open(&full, RemoteOpenMode::Read)
+            .await
+            .map_err(sftp_error)?;
+        self.store
+            .audit("download", &format!("{}:{path}", s.name))?;
+        Ok(RemoteDownload {
+            file: Arc::new(file),
+            size: attrs.size,
+            name,
+        })
+    }
+
+    /// Sends a browser's upload to `path` on a server. Blocks go out a few at a time, so a long
+    /// link keeps its speed and memory stays at `REMOTE_BLOCK * REMOTE_BLOCKS_OUT`. Data goes to a
+    /// part file that becomes the file only once it is complete.
+    pub async fn upload_remote<S, E>(
+        &self,
+        server: i64,
+        path: &str,
+        overwrite: bool,
+        declared: Option<u64>,
+        mut body: S,
+    ) -> Result<u64>
+    where
+        S: futures_util::Stream<Item = std::result::Result<axum::body::Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        use futures_util::StreamExt;
+
+        let rel = parse_rel(path)?;
+        let name = match rel.components().last() {
+            Some(n) => n.as_str().to_owned(),
+            None => return Err(bad("name a file")),
+        };
+        Name::new(&format!("{name}.hopsync-upload"))
+            .map_err(|_| bad("the file name is too long"))?;
+        let s = self.store.server(server)?;
+        let full = remote_path(&s, &rel)?;
+        let part = format!("{full}.hopsync-upload");
+        let key = format!("{server}:{}", rel.to_slash_string());
+        if !lock(&self.uploads).insert(key.clone()) {
+            return Err(ServiceError::Conflict(
+                "this file is already being uploaded".into(),
+            ));
+        }
+        let mut guard = RemoteUpload {
+            uploads: &self.uploads,
+            key,
+            cleanup: None,
+        };
+        let sftp = self.remote(&s)?.session(&self.base_opts()).await?;
+        match sftp.lstat(&full).await {
+            Ok(a) if a.kind == RemoteKind::Dir => {
+                return Err(ServiceError::Conflict("a folder has that name".into()));
+            }
+            Ok(_) if !overwrite => {
+                return Err(ServiceError::Conflict("that file already exists".into()));
+            }
+            Ok(_) | Err(SftpError::NotFound(_)) => {}
+            Err(e) => return Err(sftp_error(e)),
+        }
+        if let (Some(need), Some(free)) = (
+            declared,
+            sftp.available_bytes(&s.root).await.map_err(sftp_error)?,
+        ) && free < need.saturating_add(s.min_free)
+        {
+            return Err(ServiceError::Conflict(format!(
+                "not enough space: {need} bytes needed, {free} free, {} kept free",
+                s.min_free
+            )));
+        }
+        let file = sftp
+            .open(&part, RemoteOpenMode::WriteCreate)
+            .await
+            .map_err(sftp_error)?;
+        guard.cleanup = Some((sftp.clone(), part.clone()));
+        // Whatever an earlier crash left there is not this upload.
+        file.set_len(0).await.map_err(sftp_error)?;
+        let file = Arc::new(file);
+
+        let mut out = tokio::task::JoinSet::new();
+        let mut block: Vec<u8> = Vec::with_capacity(REMOTE_BLOCK);
+        let (mut sent, mut total) = (0u64, 0u64);
+        loop {
+            let data = match body.next().await {
+                Some(d) => Some(d.map_err(|e| bad(format!("the upload was cut off: {e}")))?),
+                None => None,
+            };
+            let ended = data.is_none();
+            let mut rest: &[u8] = data.as_deref().unwrap_or_default();
+            total += rest.len() as u64;
+            while !rest.is_empty() || (ended && !block.is_empty()) {
+                let take = rest.len().min(REMOTE_BLOCK - block.len());
+                block.extend_from_slice(&rest[..take]);
+                rest = &rest[take..];
+                if block.len() < REMOTE_BLOCK && !ended {
+                    break;
+                }
+                let full_block = std::mem::replace(&mut block, Vec::with_capacity(REMOTE_BLOCK));
+                let (f, at) = (file.clone(), sent);
+                sent += full_block.len() as u64;
+                out.spawn(async move { f.write_at(at, &full_block).await });
+                // The body is not read further until a block has room: this is the backpressure.
+                if out.len() >= REMOTE_BLOCKS_OUT {
+                    finished_block(&mut out).await?;
+                }
+            }
+            if ended {
+                break;
+            }
+        }
+        while !out.is_empty() {
+            finished_block(&mut out).await?;
+        }
+        if declared.is_some_and(|d| d != total) {
+            return Err(bad("the upload was cut off"));
+        }
+        let file = Arc::into_inner(file)
+            .ok_or_else(|| ServiceError::Internal("a block is still being written".into()))?;
+        // Not every server offers fsync; the file is still complete when it does not.
+        let _ = file.fsync().await;
+        file.close().await.map_err(sftp_error)?;
+        if overwrite {
+            sftp.rename(&part, &full, true).await
+        } else {
+            sftp.rename(&part, &full, false).await
+        }
+        .map_err(sftp_error)?;
+        guard.cleanup = None;
+        self.store.audit("upload", &format!("{}:{path}", s.name))?;
         Ok(total)
     }
 

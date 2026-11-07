@@ -103,8 +103,9 @@ hopsync setup --full-access
 
 ### Upload and download from your computer
 
-In the **This box** panel, the upload button sends files from your computer to the open folder, and the
-download button saves the ticked files to your computer. Folders can't be saved this way yet.
+In either panel, this box or a connected server, the upload button sends files from your computer to the
+open folder, and the download button saves the ticked files to your computer. Files going to or from a
+server pass through this box over SSH. Folders can't be saved this way yet.
 
 ### Settings file
 

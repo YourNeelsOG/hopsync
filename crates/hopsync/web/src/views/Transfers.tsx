@@ -4,7 +4,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChevronUp, Download, File as FileIcon, FileQuestion, Folder, GitCompareArrows, Link2, RefreshCw, Upload } from "lucide-react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRowHeight, VirtualRows } from "../components/ui";
-import { api, ApiError, uploadFile, type Direction, type Entry, type EntryKind, type JobSpec, type Server } from "../lib/api";
+import { api, ApiError, fileRoute, uploadFile, type Direction, type Entry, type EntryKind, type JobSpec, type Server } from "../lib/api";
 import { compareMark, indexByName, type Mark, sortEntries } from "../lib/files";
 import { bytes, joinPath, parentPath, shortStamp, stamp } from "../lib/format";
 import { useServers } from "../lib/hooks";
@@ -216,7 +216,6 @@ function Pane({
 
   const parts = path ? path.split("/") : [];
   const canList = servers === undefined || pane.server !== null;
-  const browserFiles = !servers;
   const [uploading, setUploading] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
 
@@ -226,11 +225,11 @@ function Pane({
       const progress = (done: number) => setUploading(`${Math.floor((done / Math.max(file.size, 1)) * 100)}% ${file.name}`);
       try {
         try {
-          await uploadFile(dest, file, false, progress);
+          await uploadFile(pane.server, dest, file, false, progress);
         } catch (e) {
           if (!(e instanceof ApiError && e.status === 409 && e.message.includes("already exists"))) throw e;
           if (!window.confirm(`${file.name} is already in this folder. Replace it?`)) continue;
-          await uploadFile(dest, file, true, progress);
+          await uploadFile(pane.server, dest, file, true, progress);
         }
         toast(`Uploaded ${file.name}.`, "ok");
       } catch (e) {
@@ -247,7 +246,7 @@ function Pane({
     if (files.length < chosen.length) toast("Only files can be saved to this computer, not folders.");
     for (const e of files) {
       const a = document.createElement("a");
-      a.href = `/api/local/file?path=${encodeURIComponent(joinPath(path, e.name))}`;
+      a.href = `${fileRoute(pane.server)}?path=${encodeURIComponent(joinPath(path, e.name))}`;
       a.download = e.name;
       a.click();
     }
@@ -272,7 +271,7 @@ function Pane({
           <strong className="flex-1 px-1 whitespace-nowrap">{title}</strong>
         )}
         <span className="min-w-0 truncate text-xs whitespace-nowrap text-muted tabular-nums">{uploading || (selected.size ? `${selected.size} selected` : "")}</span>
-        {browserFiles && (
+        {canList && (
           <>
             <input
               ref={fileInput}

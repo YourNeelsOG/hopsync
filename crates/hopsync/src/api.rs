@@ -158,6 +158,10 @@ pub fn router(svc: Arc<Service>, transport: Transport) -> Router {
         .route("/api/servers/{id}/list", get(list_remote))
         .route("/api/local/list", get(list_local))
         .route("/api/local/file", get(download_file).put(upload_file))
+        .route(
+            "/api/servers/{id}/file",
+            get(download_remote_file).put(upload_remote_file),
+        )
         .route("/api/jobs", get(list_jobs).post(add_job))
         .route("/api/jobs/dry-run", post(dry_run))
         .route("/api/jobs/{id}", get(get_job).delete(delete_job))
@@ -248,7 +252,7 @@ async fn csrf(Extension(t): Extension<Transport>, req: Request, next: Next) -> A
         ) {
             return Err(err(StatusCode::FORBIDDEN, "cross-origin request refused"));
         }
-        let wanted = if *req.method() == Method::PUT && req.uri().path() == "/api/local/file" {
+        let wanted = if *req.method() == Method::PUT && takes_a_file(req.uri().path()) {
             "application/octet-stream"
         } else {
             "application/json"
@@ -264,6 +268,11 @@ async fn csrf(Extension(t): Extension<Transport>, req: Request, next: Next) -> A
         }
     }
     Ok(next.run(req).await)
+}
+
+/// The routes whose body is a file, not JSON.
+fn takes_a_file(path: &str) -> bool {
+    path == "/api/local/file" || (path.starts_with("/api/servers/") && path.ends_with("/file"))
 }
 
 fn session_token(h: &HeaderMap) -> Option<String> {
@@ -551,17 +560,26 @@ async fn download_file(
             Err(e) => Some((Err(std::io::Error::other(e)), (reader, size))),
         }
     });
-    let mut r = axum::body::Body::from_stream(pieces).into_response();
+    Ok(attachment(
+        axum::body::Body::from_stream(pieces),
+        size,
+        &name,
+    ))
+}
+
+/// A file as a browser saves it: never shown as a page.
+fn attachment(body: axum::body::Body, size: u64, name: &str) -> Response {
+    let mut r = body.into_response();
     let h = r.headers_mut();
     h.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
     h.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
-    if let Ok(v) = HeaderValue::from_str(&disposition(&name)) {
+    if let Ok(v) = HeaderValue::from_str(&disposition(name)) {
         h.insert(header::CONTENT_DISPOSITION, v);
     }
-    Ok(r)
+    r
 }
 
 #[derive(Deserialize)]
@@ -581,6 +599,57 @@ async fn upload_file(
     let bytes = st
         .svc
         .upload_local(&q.path, q.overwrite, declared, body.into_data_stream())
+        .await?;
+    Ok(Json(json!({ "bytes": bytes })).into_response())
+}
+
+/// How many pieces of a server's file may be on their way at once, in order. With the piece size,
+/// this bounds a download's memory and keeps a long link's speed.
+const REMOTE_PIECES_OUT: usize = 8;
+const REMOTE_PIECE: u64 = 256 << 10;
+
+async fn download_remote_file(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<PathQuery>,
+) -> ApiResult<Response> {
+    use futures_util::StreamExt;
+
+    let d = st.svc.open_remote_download(id, &q.path).await?;
+    let (file, size) = (d.file, d.size);
+    let pieces = futures_util::stream::iter((0..size).step_by(REMOTE_PIECE as usize))
+        .map(move |offset| {
+            let file = file.clone();
+            async move {
+                let want = usize::try_from((size - offset).min(REMOTE_PIECE)).unwrap_or(0);
+                let mut buf = vec![0u8; want];
+                let n = file
+                    .read_at(offset, &mut buf)
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                buf.truncate(n);
+                Ok::<_, std::io::Error>(axum::body::Bytes::from(buf))
+            }
+        })
+        .buffered(REMOTE_PIECES_OUT);
+    Ok(attachment(
+        axum::body::Body::from_stream(pieces),
+        size,
+        &d.name,
+    ))
+}
+
+async fn upload_remote_file(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<UploadQuery>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> ApiResult<Response> {
+    let declared = header_str(&headers, header::CONTENT_LENGTH).and_then(|v| v.parse().ok());
+    let bytes = st
+        .svc
+        .upload_remote(id, &q.path, q.overwrite, declared, body.into_data_stream())
         .await?;
     Ok(Json(json!({ "bytes": bytes })).into_response())
 }
