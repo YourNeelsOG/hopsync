@@ -364,6 +364,8 @@ Notes and results: `docs/phase0/`.
 | 2026-11-07 | The TLS listener answers by first byte: TLS gets HTTPS, plain HTTP from loopback is served, plain HTTP from elsewhere is redirected to `https://` | Typing `http://ip:port` otherwise gives a browser error about an invalid response. Loopback stays plain so SSH tunnels and setup's own password call keep working. |
 | 2026-11-07 | Each handshake runs in its own task with a 10 s limit; at most 32 open connections per IP and 1024 in all | This listener faces the internet: one stalled client must not block `accept`, and one address must not use up the connections. A distributed flood is out of scope and belongs to a firewall. |
 | 2026-11-07 | Public listening is IPv4 (`0.0.0.0`) | `/proc/net/tcp` is what setup's port-owner check reads, and every box tested has IPv4. An IPv6-only box keeps the SSH tunnel for now. |
+| 2026-11-07 | Release candidates: a `vX.Y.Z-rc.N` tag runs the whole release workflow from any branch and publishes a pre-release | The owner wants real-box testing before publishing, with the real install command and no binary copied by hand. A final tag goes straight to `Latest`. A pre-release is never served by `releases/latest`, and `HOPSYNC_VERSION` installs it. |
+| 2026-11-07 | The HTTPS release is `v1.1.0`, not `v1.0.1` | It adds a feature. |
 
 ## 11. Open questions (owner to decide)
 
