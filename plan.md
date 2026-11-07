@@ -366,6 +366,7 @@ Notes and results: `docs/phase0/`.
 | 2026-11-07 | Public listening is IPv4 (`0.0.0.0`) | `/proc/net/tcp` is what setup's port-owner check reads, and every box tested has IPv4. An IPv6-only box keeps the SSH tunnel for now. |
 | 2026-11-07 | Release candidates: a `vX.Y.Z-rc.N` tag runs the whole release workflow from any branch and publishes a pre-release | The owner wants real-box testing before publishing, with the real install command and no binary copied by hand. A final tag goes straight to `Latest`. A pre-release is never served by `releases/latest`, and `HOPSYNC_VERSION` installs it. |
 | 2026-11-07 | The HTTPS release is `v1.1.0`, not `v1.0.1` | It adds a feature. |
+| 2026-11-07 | A browse connection closes after 3 minutes unused | Kept open, it held about 25 MB and a live server session, also after logout. Reopening costs about a second on the next listing. |
 
 ## 11. Open questions (owner to decide)
 
