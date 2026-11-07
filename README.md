@@ -298,7 +298,7 @@ Read them here: [engine](docs/phase1/security-review.md), [daemon](docs/phase2/s
 | Daemon, job queue and JSON API | Done |
 | Web UI | Done |
 | CI and release binaries (x86_64, aarch64, armv7) | Done |
-| One-line install and `hopsync setup`, with or without root | Done, not yet in a release |
+| One-line install and `hopsync setup`, with or without root | Done |
 | Built-in TLS, fuzzing | Not started |
 | Packages (`.deb`, AUR, Docker) | Not started |
 | Independent security review | Not started |
