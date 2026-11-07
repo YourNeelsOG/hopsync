@@ -65,6 +65,16 @@ impl LocalReader {
     }
 }
 
+impl Drop for LocalReader {
+    /// Read-ahead from one lane can bring back pages another lane has already read and dropped, so
+    /// ranges alone leave tens of MiB cached after a large file. One pass over the whole file ends it.
+    fn drop(&mut self) {
+        if self.cache == CachePolicy::Drop {
+            let _ = fadvise(self.file.as_fd(), 0, None, Advice::DontNeed);
+        }
+    }
+}
+
 pub struct LocalWriter {
     file: Arc<File>,
     cache: CachePolicy,
@@ -172,5 +182,47 @@ fn sync_range(file: &File, offset: u64, len: u64, flags: libc::c_uint) -> io::Re
         if err.kind() != io::ErrorKind::Interrupted {
             return Err(err);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bytes of `path` in the page cache, or None where `fincore` or a real page cache is missing.
+    fn cached_bytes(path: &std::path::Path) -> Option<u64> {
+        let out = std::process::Command::new("fincore")
+            .args(["--bytes", "--noheadings", "--output", "RES"])
+            .arg(path)
+            .output()
+            .ok()?;
+        String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+    }
+
+    #[test]
+    fn closing_a_reader_leaves_none_of_the_file_cached() {
+        // Under target/, because a tmpfs temp folder is all page cache and cannot show this.
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let path = dir.path().join("file");
+        let size = 32 << 20;
+        std::fs::write(&path, vec![7u8; size]).unwrap();
+        let file = File::open(&path).unwrap();
+        file.sync_all().unwrap();
+        std::fs::read(&path).unwrap();
+        let Some(before) = cached_bytes(&path) else {
+            return;
+        };
+        if before < (size as u64) / 2 {
+            return;
+        }
+
+        // Pages outside what this reader reads are what read-ahead leaves behind.
+        let reader = LocalReader::new(file, CachePolicy::Drop);
+        let mut one = [0u8; 4096];
+        reader.read_at(0, &mut one).unwrap();
+        drop(reader);
+
+        let after = cached_bytes(&path).unwrap();
+        assert!(after < 1 << 20, "{after} of {before} bytes still cached");
     }
 }

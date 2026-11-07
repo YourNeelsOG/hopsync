@@ -120,6 +120,38 @@ pub fn check_folder_text(folder: &str) -> Fallible<PathBuf> {
     Ok(clean)
 }
 
+/// Refuses a folder that would give the web UI the box's keys or Hopsync's own secrets. Writing to
+/// `~/.ssh/authorized_keys` or `~/.bashrc` is running commands, which no login may lead to, so a home
+/// is refused for the same reason as `/root`. A subfolder of it is fine.
+pub fn check_folder_safe(folder: &Path, data_dir: &Path, home: &Path) -> Fallible<()> {
+    let holds_keys = folder.join(".ssh").exists();
+    let inside_keys = folder.components().any(|c| c.as_os_str() == ".ssh");
+    if holds_keys
+        || inside_keys
+        || home.starts_with(folder)
+        || data_dir.starts_with(folder)
+        || folder.starts_with(data_dir)
+    {
+        return Err(format!(
+            "{} holds SSH keys or Hopsync's own secrets, and anyone logged in to the web UI could \
+             overwrite them, which gives a shell on this box. Choose a subfolder, such as \
+             {}/downloads.",
+            folder.display(),
+            folder.display()
+        ));
+    }
+    Ok(())
+}
+
+/// `~` and `~/x` as a shell would read them, since a prompt has no shell to do it.
+fn expand_tilde(text: &str, home: &Path) -> String {
+    match text.strip_prefix('~') {
+        Some("") => home.display().to_string(),
+        Some(rest) if rest.starts_with('/') => format!("{}{rest}", home.display()),
+        _ => text.to_owned(),
+    }
+}
+
 /// Who a system service runs as, from who owns the transfer folder.
 pub fn service_owner(folder: &Path, owner: Option<&str>) -> Fallible<String> {
     match owner {
@@ -651,10 +683,7 @@ fn summary(ui: &Ui, mode: Mode, s: &Started) {
     if mode != Mode::System {
         let exe =
             std::env::current_exe().map_or_else(|_| "hopsync".into(), |p| p.display().to_string());
-        rows.push((
-            "With sudo".to_owned(),
-            format!("sudo {exe} setup  (a system service instead)"),
-        ));
+        rows.extend(sudo_row(&exe, sudo_installed()));
     }
     let title = match mode {
         Mode::System => "Hopsync is running as a system service",
@@ -670,25 +699,47 @@ fn pick_folder(
     o: &SetupOptions,
     previous: Option<&Path>,
     default: &str,
+    data_dir: &Path,
 ) -> Fallible<PathBuf> {
+    let home_dir = home().unwrap_or_default();
+    let check = |text: &str| -> Fallible<PathBuf> {
+        let folder = check_folder_text(&expand_tilde(text, &home_dir))?;
+        check_folder_safe(&folder, data_dir, &home_dir)?;
+        Ok(folder)
+    };
     if let Some(f) = &o.folder {
-        return check_folder_text(f);
+        return check(f);
     }
     if let Some(p) = previous {
         return Ok(p.to_owned());
     }
     if !std::io::stdin().is_terminal() || o.password_stdin {
-        return check_folder_text(default);
+        return check(default);
     }
     loop {
         let answer = ui
             .ask_line("Folder for your files", default)
             .map_err(|e| e.to_string())?;
-        match check_folder_text(&answer) {
+        match check(&answer) {
             Ok(p) => return Ok(p),
             Err(e) => ui.warn(&e),
         }
     }
+}
+
+/// The line offering a system service, for a box where sudo could give one.
+fn sudo_row(exe: &str, sudo_installed: bool) -> Option<(String, String)> {
+    sudo_installed.then(|| {
+        (
+            "With sudo".to_owned(),
+            format!("sudo {exe} setup  (a system service instead)"),
+        )
+    })
+}
+
+fn sudo_installed() -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join("sudo").is_file()))
 }
 
 /// The last lines of the service log, shown when it will not start.
@@ -716,7 +767,13 @@ fn setup_system(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
     }
     let parsed = previous.as_deref().and_then(parse_unit);
     let running = previous.is_some() && service_active(Mode::System);
-    let folder = pick_folder(ui, o, parsed.as_ref().map(|p| p.0.as_path()), SYSTEM_FOLDER)?;
+    let folder = pick_folder(
+        ui,
+        o,
+        parsed.as_ref().map(|p| p.0.as_path()),
+        SYSTEM_FOLDER,
+        Path::new(SYSTEM_DATA),
+    )?;
     let port = choose_port(o.port, parsed.as_ref().map(|p| p.1), running)?;
 
     if run("id", &["-u", SERVICE_USER]).is_err() {
@@ -855,10 +912,16 @@ fn setup_user(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
     let parsed = previous.as_deref().and_then(parse_unit);
     let running = previous.is_some() && service_active(Mode::User);
     let home_dir = home()?;
-    let default = home_dir.to_string_lossy().into_owned();
-    let folder = pick_folder(ui, o, parsed.as_ref().map(|p| p.0.as_path()), &default)?;
-    let port = choose_port(o.port, parsed.as_ref().map(|p| p.1), running)?;
+    let default = home_dir.join("hopsync").to_string_lossy().into_owned();
     let data_dir = user_data_dir()?;
+    let folder = pick_folder(
+        ui,
+        o,
+        parsed.as_ref().map(|p| p.0.as_path()),
+        &default,
+        &data_dir,
+    )?;
+    let port = choose_port(o.port, parsed.as_ref().map(|p| p.1), running)?;
     let exec = own_binary_path(&home_dir)?;
     let spec = UnitSpec {
         folder: folder.clone(),
@@ -1062,12 +1125,13 @@ fn setup_background(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
     let previous = read_state(&data_dir);
     let running = running_pid(&data_dir).is_some();
     let home_dir = home()?;
-    let default = home_dir.to_string_lossy().into_owned();
+    let default = home_dir.join("hopsync").to_string_lossy().into_owned();
     let folder = pick_folder(
         ui,
         o,
         previous.as_ref().map(|s| s.folder.as_path()),
         &default,
+        &data_dir,
     )?;
     let port = choose_port(o.port, previous.as_ref().map(|s| s.port), running)?;
     let exec = own_binary_path(&home_dir)?;
@@ -1168,6 +1232,20 @@ fn passthrough(program: &str, args: &[&str]) -> Fallible<()> {
 
 /// `hopsync status|start|stop|restart|logs`: the same commands in every mode.
 pub fn control(what: Control) -> Fallible<()> {
+    let done = match what {
+        Control::Start => Some("started"),
+        Control::Stop => Some("stopped"),
+        Control::Restart => Some("restarted"),
+        Control::Status | Control::Logs { .. } => None,
+    };
+    run_control(what)?;
+    if let Some(done) = done {
+        println!("hopsync: {done}");
+    }
+    Ok(())
+}
+
+fn run_control(what: Control) -> Fallible<()> {
     let mode = installed_mode()?;
     if mode == Mode::Background {
         return background_control(what);
@@ -1321,7 +1399,7 @@ pub fn run_uninstall(purge: bool, yes: bool, plain: bool) -> Fallible<()> {
                 ),
                 (
                     "Delete them too".to_owned(),
-                    "set it up again, then hopsync uninstall --purge".to_owned(),
+                    format!("rm -rf {}", data_dir.display()),
                 ),
                 ("Your files".to_owned(), "were not touched".to_owned()),
             ],
@@ -1356,6 +1434,45 @@ mod tests {
                 .unwrap_err()
                 .contains("as root")
         );
+    }
+
+    #[test]
+    fn a_folder_holding_ssh_keys_or_hopsyncs_own_data_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home/neels");
+        let data = home.join(".local/share/hopsync");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(home.join("media")).unwrap();
+        // Someone else's home, as root names it: it has keys too.
+        let other = t.path().join("home/alice");
+        std::fs::create_dir_all(other.join(".ssh")).unwrap();
+
+        let parent = t.path().join("home");
+        let dot_local = home.join(".local");
+        let keys = home.join(".ssh");
+        for bad in [&home, &parent, &other, &dot_local, &keys, &data] {
+            let err = check_folder_safe(bad, &data, &home).unwrap_err();
+            assert!(err.contains("subfolder"), "{}: {err}", bad.display());
+        }
+        assert!(check_folder_safe(&home.join("media"), &data, &home).is_ok());
+        assert!(check_folder_safe(&home.join("not-made-yet"), &data, &home).is_ok());
+    }
+
+    #[test]
+    fn a_tilde_means_the_home_folder() {
+        let home = Path::new("/home/neels");
+        assert_eq!(expand_tilde("~", home), "/home/neels");
+        assert_eq!(expand_tilde("~/media", home), "/home/neels/media");
+        assert_eq!(expand_tilde("/srv/data", home), "/srv/data");
+        assert_eq!(expand_tilde("~alice/media", home), "~alice/media");
+    }
+
+    #[test]
+    fn the_sudo_hint_appears_only_where_sudo_exists() {
+        assert!(sudo_row("/x/hopsync", false).is_none());
+        let (_, command) = sudo_row("/x/hopsync", true).unwrap();
+        assert!(command.starts_with("sudo /x/hopsync setup"));
     }
 
     #[test]

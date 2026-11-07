@@ -1205,6 +1205,7 @@ impl Service {
                 &format!("server {}: {why}", job.spec.server),
             );
         }
+        let _ = tokio::task::spawn_blocking(crate::pool::release_free_memory).await;
         let _ = self.store.set_job_state(id, state, error.as_deref());
         let _ = self.store.add_job_event(
             id,

@@ -59,7 +59,7 @@ export function JobLive({ id }: { id: number }) {
         <span>
           {p.files} file{p.files === 1 ? "" : "s"}
         </span>
-        {p.problems > 0 && <span className="text-warn">{p.problems} problems</span>}
+        {p.problems > 0 && <span>{p.problems} skipped or failed</span>}
       </div>
     </div>
   );

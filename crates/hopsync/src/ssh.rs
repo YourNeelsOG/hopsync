@@ -340,13 +340,25 @@ async fn password_login<H: client::Handler>(
     })
 }
 
+/// Why a key file could not be read, with the way out when it belongs to another account. The service
+/// never runs as root, so a key under `/root` is the usual case.
+fn key_read_reason(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        "the account Hopsync runs as cannot read it. Add the generated key line to the server \
+         instead, or move the key to a file that account owns"
+            .to_owned()
+    } else {
+        e.to_string()
+    }
+}
+
 fn load_key(path: &std::path::Path) -> Result<russh::keys::PrivateKey, SshError> {
     let err = |reason: String| SshError::KeyFile {
         path: path.to_owned(),
         reason,
     };
     let mode = std::fs::metadata(path)
-        .map_err(|e| err(e.to_string()))?
+        .map_err(|e| err(key_read_reason(&e)))?
         .permissions()
         .mode()
         & 0o777;
@@ -446,4 +458,17 @@ fn has_aes_instructions() -> bool {
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn has_aes_instructions() -> bool {
     false
+}
+
+#[cfg(test)]
+mod key_file_tests {
+    use super::*;
+
+    #[test]
+    fn an_unreadable_key_says_what_to_do() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(key_read_reason(&denied).contains("generated key"));
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(!key_read_reason(&missing).contains("generated key"));
+    }
 }

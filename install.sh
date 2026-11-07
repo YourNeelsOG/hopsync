@@ -119,7 +119,7 @@ main() {
     esac
     say "Next, start the service and web UI:"
     printf '    %s setup\n' "$run"
-    if [ "$(id -u)" -ne 0 ]; then
+    if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
         printf '\n%b  No root is needed. With sudo, this runs it as a system service instead:%b\n' "$dim" "$off"
         printf '    sudo %s/hopsync setup\n' "$dir"
     fi
