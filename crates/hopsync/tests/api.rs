@@ -38,6 +38,7 @@ async fn daemon() -> Daemon {
     let svc = Service::open(ServiceConfig {
         data_dir: data.path().join("data"),
         local_root: local.path().to_owned(),
+        hidden: Default::default(),
         concurrency: 2,
         ssh: SshOptions::default(),
     })
@@ -598,6 +599,7 @@ async fn shutdown_does_not_wait_for_open_event_streams() {
     let svc = Service::open(ServiceConfig {
         data_dir: data.path().join("data"),
         local_root: data.path().to_owned(),
+        hidden: Default::default(),
         concurrency: 1,
         ssh: SshOptions::default(),
     })

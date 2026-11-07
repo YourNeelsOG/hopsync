@@ -33,7 +33,7 @@ use crate::engine::{
 };
 use crate::hostkeys::{self, HostId, HostKeyError, KnownHosts, Verdict, fingerprint};
 use crate::journal::Journal;
-use crate::paths::{EntryKind, LocalRoot, Name, RelPath, RemoteRoot};
+use crate::paths::{EntryKind, Hidden, LocalRoot, Name, RelPath, RemoteRoot};
 use crate::policy::Existing;
 use crate::sftp::{RemoteKind, SftpError};
 use crate::ssh::{KeySource, SshError, SshOptions, SshTarget};
@@ -126,6 +126,8 @@ pub struct ServiceConfig {
     pub data_dir: PathBuf,
     /// Local directory every local path stays under.
     pub local_root: PathBuf,
+    /// What stays out of reach under the local root.
+    pub hidden: Hidden,
     /// Jobs running at once.
     pub concurrency: usize,
     pub ssh: SshOptions,
@@ -253,6 +255,7 @@ pub struct Service {
     /// Serializes changes to the known_hosts file.
     pins: tokio::sync::Mutex<()>,
     local_root: PathBuf,
+    hidden: Hidden,
     journal: Arc<Journal>,
     concurrency: usize,
     ssh: SshOptions,
@@ -420,6 +423,7 @@ impl Service {
             known_path: config.data_dir.join("known_hosts"),
             pins: tokio::sync::Mutex::new(()),
             local_root: config.local_root,
+            hidden: config.hidden,
             journal,
             concurrency: config.concurrency.max(1),
             ssh: config.ssh,
@@ -912,9 +916,9 @@ impl Service {
     /// Lists a directory under the local root.
     pub async fn list_local(&self, path: &str) -> Result<Vec<Entry>> {
         let rel = parse_rel(path)?;
-        let root = self.local_root.clone();
+        let (root, hidden) = (self.local_root.clone(), self.hidden);
         let listed = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<Entry>> {
-            let local = LocalRoot::open(&root)?;
+            let local = LocalRoot::open_hiding(&root, hidden)?;
             let mut out = Vec::new();
             for e in local.read_dir(&rel)? {
                 let name = e.name.to_str().and_then(|n| Name::new(n).ok());
@@ -1089,8 +1093,8 @@ impl Service {
     async fn transfer(&self, spec: &JobSpec, opts: &TransferOptions) -> Result<(u64, u64, u64)> {
         let server = self.store.server(spec.server)?;
         let remote = self.remote(&server)?;
-        let root = self.local_root.clone();
-        let local = tokio::task::spawn_blocking(move || LocalRoot::open(&root))
+        let (root, hidden) = (self.local_root.clone(), self.hidden);
+        let local = tokio::task::spawn_blocking(move || LocalRoot::open_hiding(&root, hidden))
             .await
             .map_err(|e| ServiceError::Internal(e.to_string()))?
             .map_err(|e| ServiceError::Internal(format!("local root: {e}")))?;
@@ -1137,7 +1141,7 @@ impl Service {
             };
             let total = match next.spec.direction {
                 Direction::Push => parse_rel(&next.spec.src).ok().and_then(|rel| {
-                    let m = LocalRoot::open(&self.local_root)
+                    let m = LocalRoot::open_hiding(&self.local_root, self.hidden)
                         .ok()?
                         .metadata(&rel)
                         .ok()?;

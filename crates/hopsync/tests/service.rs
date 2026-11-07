@@ -34,6 +34,7 @@ impl Env {
         let svc = Service::open(ServiceConfig {
             data_dir: self.data.path().join("data"),
             local_root: self.local.path().to_owned(),
+            hidden: Default::default(),
             concurrency: 1,
             ssh: SshOptions::default(),
         })
@@ -460,12 +461,68 @@ async fn an_idle_browse_connection_is_closed_and_reopens_on_demand() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn full_access_on_a_home_folder_keeps_hidden_entries_out_of_every_transfer() {
+    let Some(e) = env() else { return };
+    let home = e.local.path();
+    std::fs::create_dir(home.join(".ssh")).expect("mkdir");
+    std::fs::write(home.join(".ssh/authorized_keys"), b"mine").expect("write");
+    std::fs::write(home.join(".bashrc"), b"mine").expect("write");
+    std::fs::create_dir(home.join("media")).expect("mkdir");
+    std::fs::write(home.join("media/movie"), b"film").expect("write");
+    std::fs::write(e.remote_dir().join("payload"), b"evil").expect("write");
+
+    let svc = Service::open(ServiceConfig {
+        data_dir: e.data.path().join("data"),
+        local_root: home.to_owned(),
+        hidden: hopsync::paths::Hidden::for_full_access(home),
+        concurrency: 1,
+        ssh: SshOptions::default(),
+    })
+    .expect("open service");
+    svc.start();
+    let id = trusted(&svc, &e, "a").await;
+
+    let listed: Vec<String> = svc
+        .list_local("")
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|en| en.name)
+        .collect();
+    assert_eq!(listed, ["media"]);
+    assert!(svc.list_local(".ssh").await.is_err());
+
+    let visible = svc.add_job(&push(id, "media", "media")).expect("queue");
+    let job = wait_for(&svc, visible.id, |j| j.state == JobState::Done).await;
+    assert_eq!(job.state, JobState::Done);
+    assert_eq!(
+        std::fs::read(e.remote_dir().join("media/movie")).expect("sent"),
+        b"film"
+    );
+
+    // Refused when queued or when run: either way nothing moves.
+    if let Ok(j) = svc.add_job(&push(id, ".ssh/authorized_keys", "stolen")) {
+        wait_for(&svc, j.id, |j| j.state == JobState::Failed).await;
+    }
+    assert!(!e.remote_dir().join("stolen").exists());
+
+    let mut overwrite = push(id, "payload", ".bashrc");
+    overwrite.direction = Direction::Pull;
+    overwrite.existing = "overwrite".into();
+    if let Ok(j) = svc.add_job(&overwrite) {
+        wait_for(&svc, j.id, |j| j.state == JobState::Failed).await;
+    }
+    assert_eq!(std::fs::read(home.join(".bashrc")).expect("read"), b"mine");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_second_daemon_on_the_same_data_dir_is_refused() {
     let data = tempfile::tempdir().expect("tempdir");
     let local = tempfile::tempdir().expect("tempdir");
     let config = || ServiceConfig {
         data_dir: data.path().join("data"),
         local_root: local.path().to_owned(),
+        hidden: Default::default(),
         concurrency: 1,
         ssh: SshOptions::default(),
     };
