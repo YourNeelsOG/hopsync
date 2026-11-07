@@ -8,8 +8,8 @@
 </p>
 
 <p align="center">
-  <a href="#performance">Performance</a> ·
   <a href="#install">Install</a> ·
+  <a href="#performance">Performance</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#security">Security</a> ·
   <a href="#documentation">Documentation</a> ·
@@ -24,79 +24,6 @@
 > [!NOTE]
 > Hopsync is early software. The transfer engine, daemon and web UI work and are tested, but there
 > has been no independent security review. See [Project status](#project-status).
-
-## Why Hopsync
-
-`scp` and `sftp` move one stream at a time. On a long link, the SSH window limits that stream to a
-few MB/s, and every small file costs several round trips. Hopsync runs on one box and pushes to or
-pulls from any other box over SSH, with no agent to install there:
-
-- **Parallel lanes.** One transfer opens several SSH connections and splits big files across them.
-  Lanes start at 4 and grow to 16 while each new lane still adds speed.
-- **Many small files at once.** Files stay in flight together, so the round-trip time is paid once
-  per batch instead of once per file.
-- **Resume after anything.** An interrupted file continues from its last durable chunk, even after
-  `kill -9`.
-- **Careful with your data.** Host keys are pinned, and a changed key stops the transfer. Existing
-  files are skipped unless you choose otherwise. Data goes to `name.hopsync-part` and is renamed
-  into place only when complete. `--verify` reads every chunk back and compares xxh3-128 hashes
-  before the rename.
-- **Light on the box.** Memory has a fixed limit that does not grow with file size. Page cache is
-  dropped after streaming, so a shared seedbox keeps its cache for its own work. There are no
-  temporary copies.
-
-## Performance
-
-Measured against OpenSSH `scp` and `sftp` on a shared seedbox about 200 ms away. Each tool used the
-same server, key and data, one after another.
-
-<img src="docs/assets/charts/real-link-big-file.svg" alt="Bar chart. Upload: hopsync 11.7, scp 5.9, sftp 6.1 MB/s. Download: hopsync 15.7, scp 7.9, sftp 7.5 MB/s." width="760">
-
-<img src="docs/assets/charts/real-link-small-files.svg" alt="Bar chart. Upload: hopsync 39, scp 249, sftp 188 seconds. Download: hopsync 31, scp 250, sftp 252 seconds." width="760">
-
-The speed has a cost. Parallel lanes use more memory than one stream on big files, up to a fixed
-limit set by the lane count and buffer sizes:
-
-<img src="docs/assets/charts/memory.svg" alt="Bar chart of peak client memory. Big file up: hopsync 40.7, scp 14.8, sftp 14.8 MiB. Big file down: hopsync 28.0, scp 14.2, sftp 14.4 MiB. Small files up: hopsync 10.5, scp 12.9, sftp 13.2 MiB." width="760">
-
-<details>
-<summary>Loopback charts and all numbers</summary>
-<br>
-
-Loopback uses tmpfs on both sides, so it measures CPU cost, not a disk or a network.
-
-<img src="docs/assets/charts/loopback-big-file.svg" alt="Bar chart. Upload: hopsync 734, scp 526, sftp 527 MB/s. Download: hopsync 1,057, scp 573, sftp 568 MB/s." width="760">
-
-<img src="docs/assets/charts/loopback-small-files.svg" alt="Bar chart. Upload: hopsync 0.30, scp 0.65, sftp 0.52 seconds. Download: hopsync 0.28, scp 0.67, sftp 0.66 seconds." width="760">
-
-| 200 ms link, median of 2 runs | hopsync | scp | sftp |
-|---|---:|---:|---:|
-| Upload one 256 MiB file | **11.7 MB/s** | 5.9 MB/s | 6.1 MB/s |
-| Download one 256 MiB file | **15.7 MB/s** | 7.9 MB/s | 7.5 MB/s |
-| Upload 300 small files | **39.0 s** | 249.0 s | 188.2 s |
-| Download 300 small files | **31.3 s** | 250.2 s | 251.5 s |
-| Peak memory, upload one big file | 40.7 MiB | 14.8 MiB | 14.8 MiB |
-| Peak memory, download one big file | 28.0 MiB | 14.2 MiB | 14.4 MiB |
-| Peak memory, upload small files | 10.5 MiB | 12.9 MiB | 13.2 MiB |
-
-| Loopback, median of 3 runs | hopsync | scp | sftp |
-|---|---:|---:|---:|
-| Upload one 512 MiB file | **734 MB/s** | 526 MB/s | 527 MB/s |
-| Download one 512 MiB file | **1,057 MB/s** | 573 MB/s | 568 MB/s |
-| Upload 2,000 small files | **0.30 s** | 0.65 s | 0.52 s |
-| Download 2,000 small files | **0.28 s** | 0.67 s | 0.66 s |
-
-</details>
-
-These results have limits:
-
-- The seedbox is shared, so other users' load varies between runs. Real-link results use only 2 runs
-  because one `scp` tree run takes over 4 minutes.
-- The real-link big-file runs last about 20 seconds, and that includes the time lanes take to ramp up.
-- `rsync`, `rclone` and `lftp` are not compared yet. Neither is a 1 Gbps link.
-
-[Method and caveats](docs/phase1/benchmarks.md) · [Medians as JSON](docs/benchmarks/results.json) ·
-[Benchmark script](benches/bench.py) · [Chart script](benches/charts.py)
 
 ## Install
 
@@ -203,6 +130,79 @@ signed record of the build that made it, which the [GitHub CLI](https://cli.gith
 ```bash
 gh attestation verify hopsync-x86_64-linux.tar.gz --repo YourNeelsOG/hopsync
 ```
+
+## Why Hopsync
+
+`scp` and `sftp` move one stream at a time. On a long link, the SSH window limits that stream to a
+few MB/s, and every small file costs several round trips. Hopsync runs on one box and pushes to or
+pulls from any other box over SSH, with no agent to install there:
+
+- **Parallel lanes.** One transfer opens several SSH connections and splits big files across them.
+  Lanes start at 4 and grow to 16 while each new lane still adds speed.
+- **Many small files at once.** Files stay in flight together, so the round-trip time is paid once
+  per batch instead of once per file.
+- **Resume after anything.** An interrupted file continues from its last durable chunk, even after
+  `kill -9`.
+- **Careful with your data.** Host keys are pinned, and a changed key stops the transfer. Existing
+  files are skipped unless you choose otherwise. Data goes to `name.hopsync-part` and is renamed
+  into place only when complete. `--verify` reads every chunk back and compares xxh3-128 hashes
+  before the rename.
+- **Light on the box.** Memory has a fixed limit that does not grow with file size. Page cache is
+  dropped after streaming, so a shared seedbox keeps its cache for its own work. There are no
+  temporary copies.
+
+## Performance
+
+Measured against OpenSSH `scp` and `sftp` on a shared seedbox about 200 ms away. Each tool used the
+same server, key and data, one after another.
+
+<img src="docs/assets/charts/real-link-big-file.svg" alt="Bar chart. Upload: hopsync 11.7, scp 5.9, sftp 6.1 MB/s. Download: hopsync 15.7, scp 7.9, sftp 7.5 MB/s." width="760">
+
+<img src="docs/assets/charts/real-link-small-files.svg" alt="Bar chart. Upload: hopsync 39, scp 249, sftp 188 seconds. Download: hopsync 31, scp 250, sftp 252 seconds." width="760">
+
+The speed has a cost. Parallel lanes use more memory than one stream on big files, up to a fixed
+limit set by the lane count and buffer sizes:
+
+<img src="docs/assets/charts/memory.svg" alt="Bar chart of peak client memory. Big file up: hopsync 40.7, scp 14.8, sftp 14.8 MiB. Big file down: hopsync 28.0, scp 14.2, sftp 14.4 MiB. Small files up: hopsync 10.5, scp 12.9, sftp 13.2 MiB." width="760">
+
+<details>
+<summary>Loopback charts and all numbers</summary>
+<br>
+
+Loopback uses tmpfs on both sides, so it measures CPU cost, not a disk or a network.
+
+<img src="docs/assets/charts/loopback-big-file.svg" alt="Bar chart. Upload: hopsync 734, scp 526, sftp 527 MB/s. Download: hopsync 1,057, scp 573, sftp 568 MB/s." width="760">
+
+<img src="docs/assets/charts/loopback-small-files.svg" alt="Bar chart. Upload: hopsync 0.30, scp 0.65, sftp 0.52 seconds. Download: hopsync 0.28, scp 0.67, sftp 0.66 seconds." width="760">
+
+| 200 ms link, median of 2 runs | hopsync | scp | sftp |
+|---|---:|---:|---:|
+| Upload one 256 MiB file | **11.7 MB/s** | 5.9 MB/s | 6.1 MB/s |
+| Download one 256 MiB file | **15.7 MB/s** | 7.9 MB/s | 7.5 MB/s |
+| Upload 300 small files | **39.0 s** | 249.0 s | 188.2 s |
+| Download 300 small files | **31.3 s** | 250.2 s | 251.5 s |
+| Peak memory, upload one big file | 40.7 MiB | 14.8 MiB | 14.8 MiB |
+| Peak memory, download one big file | 28.0 MiB | 14.2 MiB | 14.4 MiB |
+| Peak memory, upload small files | 10.5 MiB | 12.9 MiB | 13.2 MiB |
+
+| Loopback, median of 3 runs | hopsync | scp | sftp |
+|---|---:|---:|---:|
+| Upload one 512 MiB file | **734 MB/s** | 526 MB/s | 527 MB/s |
+| Download one 512 MiB file | **1,057 MB/s** | 573 MB/s | 568 MB/s |
+| Upload 2,000 small files | **0.30 s** | 0.65 s | 0.52 s |
+| Download 2,000 small files | **0.28 s** | 0.67 s | 0.66 s |
+
+</details>
+
+These results have limits:
+
+- The seedbox is shared, so other users' load varies between runs. Real-link results use only 2 runs
+  because one `scp` tree run takes over 4 minutes.
+- The real-link big-file runs last about 20 seconds, and that includes the time lanes take to ramp up.
+- `rsync`, `rclone` and `lftp` are not compared yet. Neither is a 1 Gbps link.
+
+[Method and caveats](docs/phase1/benchmarks.md) · [Medians as JSON](docs/benchmarks/results.json) ·
+[Benchmark script](benches/bench.py) · [Chart script](benches/charts.py)
 
 ## Build from source
 

@@ -1,10 +1,12 @@
 name: Release
 
-# A version tag on main builds, tests and publishes the release. Building has read-only access; only
+# A version tag on main builds, tests and publishes the release. A release candidate tag such as
+# v1.2.0-rc.1 goes through the same steps from any branch, and is published as a pre-release, which
+# the releases/latest install URL never serves. Building has read-only access; only
 # the publish job can write, and it runs none of the repository's code.
 on:
   push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"]
 
 permissions:
   contents: read
@@ -21,7 +23,10 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          case "$TAG" in
+            *-rc.*) ;;
+            *) git merge-base --is-ancestor "$GITHUB_SHA" origin/main ;;
+          esac
           version=$(cargo metadata --no-deps --format-version 1 --locked |
             python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "hopsync"))')
           test "$TAG" = "v$version"
@@ -95,4 +100,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "$TAG" --verify-tag --generate-notes
+        run: |
+          case "$TAG" in
+            *-rc.*) kind=--prerelease ;;
+            *) kind=--latest ;;
+          esac
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "$TAG" --verify-tag --generate-notes "$kind"

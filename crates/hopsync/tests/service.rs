@@ -427,6 +427,39 @@ async fn a_generated_key_is_sealed_and_works_once_installed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_idle_browse_connection_is_closed_and_reopens_on_demand() {
+    let Some(e) = env() else { return };
+    let svc = e.open();
+    let s = svc.add_server(&e.spec("a"), false).expect("add");
+    let probe = svc.probe(s.id).await.expect("probe");
+    svc.trust(s.id, &probe.fingerprint, false)
+        .await
+        .expect("trust");
+    svc.list_remote(s.id, "").await.expect("list");
+    assert_eq!(e.sshd.sftp_server_count(), 1, "browsing keeps one session");
+
+    assert_eq!(
+        svc.close_idle_browse(Duration::from_secs(3600)),
+        0,
+        "a connection used just now stays open"
+    );
+    assert_eq!(e.sshd.sftp_server_count(), 1);
+
+    assert_eq!(svc.close_idle_browse(Duration::ZERO), 1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while e.sshd.sftp_server_count() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server still holds the session after it was closed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    svc.list_remote(s.id, "").await.expect("reopens on demand");
+    assert_eq!(e.sshd.sftp_server_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_second_daemon_on_the_same_data_dir_is_refused() {
     let data = tempfile::tempdir().expect("tempdir");
     let local = tempfile::tempdir().expect("tempdir");
