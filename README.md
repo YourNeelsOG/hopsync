@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="#performance">Performance</a> ·
-  <a href="#build-from-source">Build</a> ·
+  <a href="#install">Install</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#security">Security</a> ·
   <a href="#documentation">Documentation</a> ·
@@ -22,9 +22,8 @@
 </picture>
 
 > [!NOTE]
-> Hopsync is pre-release software. The transfer engine, daemon and web UI work and are tested, but
-> there are no release binaries yet and no independent security review. See
-> [Project status](#project-status).
+> Hopsync is early software. The transfer engine, daemon and web UI work and are tested, but there
+> has been no independent security review. See [Project status](#project-status).
 
 ## Why Hopsync
 
@@ -99,13 +98,81 @@ These results have limits:
 [Method and caveats](docs/phase1/benchmarks.md) · [Medians as JSON](docs/benchmarks/results.json) ·
 [Benchmark script](benches/bench.py) · [Chart script](benches/charts.py)
 
+## Install
+
+You do not need root. Run one of these on the box that will run transfers:
+
+```bash
+curl -fsSL https://github.com/YourNeelsOG/hopsync/releases/latest/download/install.sh | sh
+```
+
+```bash
+wget -qO- https://github.com/YourNeelsOG/hopsync/releases/latest/download/install.sh | sh
+```
+
+Then start the service and web UI, and choose a password:
+
+```bash
+hopsync setup
+```
+
+Setup prints the command that opens the web UI from your own PC. Check on the service with:
+
+```bash
+systemctl status hopsync
+```
+
+Setup uses what the box allows, and prints the commands that work on it:
+
+| The box has | Hopsync runs as | Check it with |
+|---|---|---|
+| Root or sudo, and systemd | A system service, as an unprivileged user | `systemctl status hopsync` |
+| No root, and `systemctl --user` works | A user service | `systemctl --user status hopsync` |
+| No root and no `systemctl --user`, as on many shared seedboxes | A background process, restarted after a reboot through cron where allowed | `hopsync status` |
+
+With no root, use `sudo` to get the system service instead, if you have it:
+
+```bash
+sudo ~/.local/bin/hopsync setup
+```
+
+`hopsync status`, `start`, `stop`, `restart` and `logs` work the same in all three. If the default port
+is taken, for example by another customer on a shared box, setup picks the next free one.
+
+Run `hopsync setup` again at any time: it keeps your folder, port and password, and restarts the
+service only if something changed. For a new version, run the install command again, then
+`hopsync setup`. To remove the service and binary, run `hopsync uninstall`, which keeps your files
+and settings. `hopsync uninstall --purge` also deletes the settings, saved servers and keys.
+
+The install script supports `x86_64`, `aarch64` and `armv7`, and checks the archive against
+`sha256sums.txt`. Setup was tested under real systemd on Debian 12, Ubuntu 22.04 and Rocky 9.
+The folder for your files cannot contain spaces. Setup refuses a root-owned folder, because Hopsync
+never runs as root, and says how to fix it.
+
+To install by hand, download the archive for your machine from
+[Releases](https://github.com/YourNeelsOG/hopsync/releases), and copy `hopsync` to a folder on your
+`PATH`.
+
+The binary runs on Linux with glibc 2.17 or later, which covers CentOS 7 and every current Debian and
+Ubuntu. It has been run on CentOS 7, Debian 10 to 12 and Ubuntu 20.04 to 24.04, all on a recent
+kernel. It does not run on musl systems such as Alpine. Kernels older than 5.6 use a fallback to
+confine paths, and no release has been tested on one.
+
+To check a download, compare it with `sha256sums.txt` from the same release. Each archive also has a
+signed record of the build that made it, which the [GitHub CLI](https://cli.github.com) can verify:
+
+```bash
+gh attestation verify hopsync-x86_64-linux.tar.gz --repo YourNeelsOG/hopsync
+```
+
 ## Build from source
 
 You need these on the machine that builds:
 
 - Rust. `rust-toolchain.toml` pins the version.
-- Node.js 20.19 or later, or 22.12 or later, with [pnpm](https://pnpm.io). `packageManager` in
-  `package.json` pins the pnpm version.
+- Node.js 20.19 or later, or 22.12 or later, with [pnpm](https://pnpm.io) 10. pnpm 9 stops with an
+  error that names the version it needs. To use the pinned version without installing it, replace
+  `pnpm` with `npx pnpm@10.34.7`.
 
 ```bash
 cd crates/hopsync/web
@@ -117,7 +184,11 @@ HOPSYNC_REQUIRE_UI=1 cargo build --release
 
 The result is `target/release/hopsync`, about 20 MB, with the whole web UI compiled in. Copy that
 one file to your server. **The server does not need Node, npm or anything else from the build**, and
-the UI never loads anything from another site at runtime. Hopsync runs on Linux 5.6 or later.
+the UI never loads anything from another site at runtime.
+
+A plain `cargo build` links against the glibc of the machine that builds, so the binary may refuse to
+start on a server with an older one. [contrib/release/build.sh](contrib/release/build.sh) makes the
+release builds, which avoid this.
 
 If you build without the UI, the binary still works and its web page tells you how to add the UI.
 `HOPSYNC_REQUIRE_UI=1` turns that case into a build error.
@@ -126,24 +197,24 @@ If you build without the UI, the binary still works and its web page tells you h
 
 ### Web UI
 
-Start the daemon on the box that will run transfers. `--root` is the only local folder it can touch.
-
-```bash
-hopsync serve --root ~/downloads
-```
-
-The daemon listens on `127.0.0.1:7890`. To reach it on a remote box, forward the port over SSH:
+Run [`hopsync setup`](#install) on the box that will run transfers. The folder you choose is the only
+local folder it can touch. The web UI listens on `127.0.0.1:7890`. To reach it on a remote box, run the
+command that setup printed on your own PC:
 
 ```bash
 ssh -L 7890:127.0.0.1:7890 you@your-box
 ```
 
-Open <http://127.0.0.1:7890/>. There is no default password. The daemon's log names a file holding a
-one-time setup token, and the page asks for that token once to set the admin password.
+Open <http://127.0.0.1:7890/> and log in with the password you chose in setup. There is no default
+password.
+
+To run the daemon by hand instead, use `hopsync serve --root ~/downloads`. Its log then names a file
+holding a one-time setup token, and the page asks for that token once to set the password.
 
 Then add a server under **Servers**. Compare the host key fingerprint with the one your provider
 shows, and confirm it. Hopsync can create a key for that server and install it with the account
-password once, so no password is stored.
+password once, so no password is stored. This works with servers that ask for the password by either
+SSH method, but not with servers that also ask for a one-time code.
 
 On **Transfers** you browse both sides, compare them, select files and folders, and copy them either
 way. Before anything is queued, a preview shows what would be new, replaced or skipped. No question
@@ -193,8 +264,8 @@ hopsync job pause 12
 
 ### Run as a service
 
-[contrib/systemd](contrib/systemd) has a hardened system unit, and a user unit for shared seedboxes
-where you have no root. Install steps are at the top of each file.
+`hopsync setup` does this for you. [contrib/systemd](contrib/systemd) has the hardened system and user
+units it installs, with steps at the top of each file for doing it by hand.
 
 ## Security
 
@@ -215,7 +286,9 @@ in front and use `--secure-cookies`.
 
 Every review so far was done by the people and tools that built the code, so none is independent.
 Read them here: [engine](docs/phase1/security-review.md), [daemon](docs/phase2/security-review.md),
-[web UI](docs/phase3/security-review.md), [React UI](docs/phase3/react-security-review.md).
+[web UI](docs/phase3/security-review.md), [React UI](docs/phase3/react-security-review.md),
+[logins and releases](docs/phase4/security-review.md),
+[install and setup](docs/phase4/install-security-review.md).
 
 ## Project status
 
@@ -224,13 +297,19 @@ Read them here: [engine](docs/phase1/security-review.md), [daemon](docs/phase2/s
 | Transfer engine and CLI | Done |
 | Daemon, job queue and JSON API | Done |
 | Web UI | Done |
-| Built-in TLS, fuzzing, CI | Not started |
-| Release binaries and packages (`.deb`, AUR, Docker) | Not started |
+| CI and release binaries (x86_64, aarch64, armv7) | Done |
+| One-line install and `hopsync setup`, with or without root | Done |
+| Built-in TLS, fuzzing | Not started |
+| Packages (`.deb`, AUR, Docker) | Not started |
 | Independent security review | Not started |
 | Comparison with `rsync`, `rclone` and `lftp`, and a 1 Gbps test | Not started |
 
 Known limits today:
 
+- SSH key files must be ed25519 or ECDSA, without a passphrase. RSA keys and passphrase-protected keys
+  are refused with a message that says so, and `ssh-agent` is not used. Keys that Hopsync creates
+  avoid all of this.
+- A server with only RSA host keys cannot be added. Most servers also have an ed25519 host key.
 - The queue shows a percentage and time left only for a single-file upload. Downloads and folders
   show speed and bytes so far.
 - A transfer runs between the box running Hopsync and one server. To copy between two other boxes,
@@ -258,6 +337,7 @@ pnpm dev         # UI with hot reload, proxied to a daemon on 127.0.0.1:7890
 pnpm test        # unit tests
 pnpm typecheck
 pnpm e2e         # browser test with a real daemon and sshd, needs Python playwright
+pnpm e2e:password  # password key install against OpenSSH in a container, needs Docker
 ```
 
 ## Contributing

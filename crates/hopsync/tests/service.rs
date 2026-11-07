@@ -216,7 +216,7 @@ async fn a_paused_job_resumes_and_a_restart_requeues_running_jobs() {
     {
         let svc = e.open();
         let id = trusted(&svc, &e, "box").await;
-        svc.pause_queue();
+        svc.pause_queue().expect("hold");
         let job = svc.add_job(&push(id, "big", "big")).expect("queue");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
@@ -224,7 +224,7 @@ async fn a_paused_job_resumes_and_a_restart_requeues_running_jobs() {
             JobState::Queued,
             "a paused queue starts nothing"
         );
-        svc.resume_queue();
+        svc.resume_queue().expect("release");
         wait_for(&svc, job.id, |j| j.state == JobState::Running).await;
         svc.pause_job(job.id).expect("pause");
         let paused = wait_for(&svc, job.id, |j| j.state != JobState::Running).await;
@@ -236,13 +236,14 @@ async fn a_paused_job_resumes_and_a_restart_requeues_running_jobs() {
         assert!(std::fs::read(e.remote_dir().join("big")).expect("read") == data);
 
         // Simulate a daemon that died mid-job.
-        svc.pause_queue();
+        svc.pause_queue().expect("hold");
         let other = svc.add_job(&push(id, "big", "copy")).expect("queue");
         svc.store
             .set_job_state(other.id, JobState::Running, None)
             .expect("force running");
     }
     let svc = e.open();
+    svc.resume_queue().expect("release");
     let jobs = svc.store.jobs(None).expect("jobs");
     let copy = jobs
         .iter()
@@ -250,6 +251,89 @@ async fn a_paused_job_resumes_and_a_restart_requeues_running_jobs() {
         .expect("copy job");
     let copy = wait_for(&svc, copy.id, |j| j.state.is_final()).await;
     assert_eq!(copy.state, JobState::Done, "{:?}", copy.error);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_queue_stays_held_across_a_restart() {
+    let Some(e) = env() else { return };
+    std::fs::write(e.local.path().join("f"), b"data").expect("write");
+    let job = {
+        let svc = e.open();
+        let id = trusted(&svc, &e, "box").await;
+        svc.pause_queue().expect("hold");
+        svc.add_job(&push(id, "f", "f")).expect("queue")
+    };
+    let svc = e.open();
+    assert!(svc.queue_paused(), "the hold is still on after a restart");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(svc.store.job(job.id).expect("job").state, JobState::Queued);
+    assert!(!e.remote_dir().join("f").exists());
+
+    svc.resume_queue().expect("release");
+    let done = wait_for(&svc, job.id, |j| j.state.is_final()).await;
+    assert_eq!(done.state, JobState::Done, "{:?}", done.error);
+    drop(svc);
+    assert!(
+        !e.open().queue_paused(),
+        "releasing the queue also lasts across a restart"
+    );
+}
+
+/// The daemon dies after you press stop and before the transfer has reported that it stopped.
+/// The job is forced to running so that nothing can finish the stop before the restart.
+async fn stop_then_restart(stop: fn(&Service, i64) -> Result<(), ServiceError>) -> (Env, Job) {
+    let e = env().expect("sshd");
+    std::fs::write(e.local.path().join("f"), b"data").expect("write");
+    let job = {
+        let svc = e.open();
+        let id = trusted(&svc, &e, "box").await;
+        svc.pause_queue().expect("hold");
+        let job = svc.add_job(&push(id, "f", "f")).expect("queue");
+        svc.store
+            .set_job_state(job.id, JobState::Running, None)
+            .expect("force running");
+        stop(&svc, job.id).expect("stop");
+        assert_eq!(svc.store.job(job.id).expect("job").state, JobState::Running);
+        job
+    };
+    let svc = e.open();
+    svc.resume_queue().expect("release");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after = svc.store.job(job.id).expect("job");
+    assert!(!e.remote_dir().join("f").exists(), "it must not run again");
+    (e, after)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pause_pressed_just_before_a_restart_is_kept() {
+    if env().is_none() {
+        return;
+    }
+    let (e, job) = stop_then_restart(Service::pause_job).await;
+    assert_eq!(job.state, JobState::Paused);
+    assert!(job.finished.is_none());
+
+    let svc = e.open();
+    assert!(
+        svc.store
+            .job_events(job.id)
+            .expect("events")
+            .iter()
+            .any(|ev| ev.text == "paused")
+    );
+    svc.resume_job(job.id).expect("resume");
+    let done = wait_for(&svc, job.id, |j| j.state.is_final()).await;
+    assert_eq!(done.state, JobState::Done, "{:?}", done.error);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_pressed_just_before_a_restart_is_kept() {
+    if env().is_none() {
+        return;
+    }
+    let (_e, job) = stop_then_restart(Service::cancel_job).await;
+    assert_eq!(job.state, JobState::Cancelled);
+    assert!(job.finished.is_some(), "a cancelled job is finished");
 }
 
 #[tokio::test(flavor = "multi_thread")]

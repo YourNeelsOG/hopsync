@@ -1,2 +1,6 @@
+# pnpm 9 reads this file only when `packages` is set; with it, the `engines` check in package.json
+# can tell pnpm 9 users which version they need. pnpm 9 ignores minimumReleaseAge, so it must not run.
+packages:
+  - .
 # Refuse any package, direct or indirect, published in the last 14 days (in minutes).
 minimumReleaseAge: 20160

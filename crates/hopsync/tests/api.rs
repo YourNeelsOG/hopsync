@@ -689,7 +689,7 @@ async fn an_event_stream_ends_when_its_session_does() {
         .expect("logout")
         .ok()
         .expect("logged out");
-    d.svc.pause_queue();
+    d.svc.pause_queue().expect("hold");
 
     // The body ends with the last chunk; the connection itself may stay open for keep-alive.
     let mut rest = Vec::new();

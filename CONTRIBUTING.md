@@ -51,11 +51,10 @@ pnpm test
 pnpm build
 ```
 
-Use the pnpm version that `packageManager` in `package.json` names. An older pnpm stops with
-`packages field missing or empty`. To run the pinned version without installing it, replace `pnpm`
-with `npx pnpm@<version>`.
+Use the pnpm version that `packageManager` in `package.json` names. pnpm 9 stops with an error that
+names it. To run the pinned version without installing it, replace `pnpm` with `npx pnpm@<version>`.
 
-No CI runs on pull requests yet, so include the results of these checks in your pull request.
+CI runs these checks on every pull request, along with the browser tests.
 
 ## Project rules
 
