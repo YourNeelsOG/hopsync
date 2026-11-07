@@ -106,6 +106,11 @@ impl RelPath {
         &self.0
     }
 
+    /// The components before the last one: the folders on the way to this path.
+    pub fn parents(&self) -> &[Name] {
+        self.0.split_last().map_or(&[], |(_, parents)| parents)
+    }
+
     /// "a/b/c", or "" for the root.
     pub fn to_slash_string(&self) -> String {
         let parts: Vec<&str> = self.0.iter().map(Name::as_str).collect();

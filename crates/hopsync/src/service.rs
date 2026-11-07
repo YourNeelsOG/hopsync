@@ -112,7 +112,11 @@ impl From<HostKeyError> for ServiceError {
 
 impl From<TransferError> for ServiceError {
     fn from(e: TransferError) -> Self {
-        Self::Transfer(e)
+        match e {
+            // The request names a path that is not allowed; the server did nothing wrong.
+            TransferError::SymlinkOnTheWay(_) => Self::BadRequest(e.to_string()),
+            e => Self::Transfer(e),
+        }
     }
 }
 
@@ -187,34 +191,13 @@ impl Drop for RemoteUpload<'_> {
     }
 }
 
-/// `rel` under a server's root folder.
-fn remote_path(s: &Server, rel: &RelPath) -> Result<String> {
-    Ok(RemoteRoot::parse(&s.root)
-        .map_err(|e| bad(format!("root folder: {e}")))?
-        .join(rel))
+fn remote_root(s: &Server) -> Result<RemoteRoot> {
+    RemoteRoot::parse(&s.root).map_err(|e| bad(format!("root folder: {e}")))
 }
 
-/// Refuses a path whose parent folders include a symlink, which could lead out of the server's
-/// root folder. SFTP has no way to open a path "beneath" a folder, so each one is checked. A
-/// missing folder ends the walk: the open or the rename that follows reports it.
-async fn refuse_links_on_the_way(
-    sftp: &crate::sftp::Sftp,
-    s: &Server,
-    rel: &RelPath,
-) -> Result<()> {
-    let names: Vec<&str> = rel.components().iter().map(Name::as_str).collect();
-    for end in 1..names.len() {
-        let folder = remote_path(s, &parse_rel(&names[..end].join("/"))?)?;
-        match sftp.lstat(&folder).await {
-            Ok(a) if a.kind == RemoteKind::Symlink => {
-                return Err(bad(format!("{} is a symlink", names[..end].join("/"))));
-            }
-            Ok(_) => {}
-            Err(SftpError::NotFound(_)) => return Ok(()),
-            Err(e) => return Err(sftp_error(e)),
-        }
-    }
-    Ok(())
+/// `rel` under a server's root folder.
+fn remote_path(s: &Server, rel: &RelPath) -> Result<String> {
+    Ok(remote_root(s)?.join(rel))
 }
 
 /// A server's refusal, in the terms the API answers with.
@@ -1191,7 +1174,7 @@ impl Service {
         let s = self.store.server(server)?;
         let full = remote_path(&s, &rel)?;
         let sftp = self.remote(&s)?.session(&self.base_opts()).await?;
-        refuse_links_on_the_way(&sftp, &s, &rel).await?;
+        engine::refuse_links_in(&sftp, &remote_root(&s)?, rel.parents()).await?;
         let attrs = sftp.lstat(&full).await.map_err(sftp_error)?;
         // A symlink could lead out of the server's root folder.
         if attrs.kind != RemoteKind::File {
@@ -1249,7 +1232,7 @@ impl Service {
             cleanup: None,
         };
         let sftp = self.remote(&s)?.session(&self.base_opts()).await?;
-        refuse_links_on_the_way(&sftp, &s, &rel).await?;
+        engine::refuse_links_in(&sftp, &remote_root(&s)?, rel.parents()).await?;
         // Opening follows a symlink, so one planted at this name would be written through.
         match sftp.lstat(&part).await {
             Ok(a) if a.kind != RemoteKind::File => {

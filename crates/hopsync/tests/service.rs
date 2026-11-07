@@ -682,6 +682,36 @@ async fn browser_transfers_do_not_pass_through_a_symlink_on_the_server() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn browsing_a_server_does_not_pass_through_a_symlink() {
+    let Some(e) = env() else { return };
+    let svc = e.open();
+    let id = trusted(&svc, &e, "a").await;
+    let outside = e.sshd.dir().join("outside-dir");
+    std::fs::create_dir_all(outside.join("sub")).expect("mkdir");
+    std::fs::write(outside.join("secret"), b"secret").expect("write");
+    std::os::unix::fs::symlink(&outside, e.remote_dir().join("link")).expect("symlink");
+    std::fs::create_dir_all(e.remote_dir().join("real/folder")).expect("mkdir");
+
+    for path in ["link", "link/sub"] {
+        assert!(
+            matches!(
+                svc.list_remote(id, path).await,
+                Err(ServiceError::BadRequest(_))
+            ),
+            "{path} must be refused"
+        );
+    }
+    // The link still shows as a row, and real folders still open.
+    let top = svc.list_remote(id, "").await.expect("list");
+    assert!(
+        top.iter()
+            .any(|f| f.name == "link" && f.kind == Kind::Symlink)
+    );
+    let real = svc.list_remote(id, "real").await.expect("list");
+    assert!(real.iter().any(|f| f.name == "folder"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_cut_upload_to_a_server_leaves_nothing_behind() {
     let Some(e) = env() else { return };
     let svc = e.open();

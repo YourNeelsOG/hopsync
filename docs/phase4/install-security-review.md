@@ -109,7 +109,12 @@ Accepted risks of public mode:
   cannot send without a preflight, and only these routes accept that type. Local paths pass through
   `LocalRoot`, so roots, symlinks and hidden entries apply. Server paths stay under that server's root
   folder, a blocked host key refuses them, and neither a symlink at the path, in a parent folder, nor at
-  the part file's name is followed. Downloads are `attachment` with `nosniff`, and the name is
+  the part file's name is followed.
+- **Server paths a caller supplies do not pass through a symlink.** Browsing, push, pull and dry runs check
+  each folder on the way with `lstat` (`engine::refuse_links_in`), and browsing checks the last name too. SFTP
+  has no equivalent of `openat2(RESOLVE_BENEATH)`, so a link created between the check and the use is not
+  caught; the server account could reach that target over SSH anyway. Known gap: a job's part file is opened
+  without checking for a planted link, because that check would add a round trip per pushed file. Downloads are `attachment` with `nosniff`, and the name is
   percent-encoded, so a hostile file name cannot add a header or run as a page. Both are in the audit log.
 - **A password typed in Add server is sent only after the host key is trusted**, in the one login call,
   and is never stored or logged.
