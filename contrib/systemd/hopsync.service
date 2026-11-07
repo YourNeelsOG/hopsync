@@ -1,4 +1,5 @@
 # System unit: runs Hopsync as the dedicated unprivileged user "hopsync".
+# `hopsync setup` installs this file with your values. To do it by hand:
 # Install: useradd --system --create-home --home-dir /var/lib/hopsync hopsync
 #          install -m 0755 hopsync /usr/local/bin/hopsync
 #          cp hopsync.service /etc/systemd/system/ && systemctl enable --now hopsync

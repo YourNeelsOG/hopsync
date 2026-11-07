@@ -109,6 +109,48 @@ enum Cmd {
         #[command(flatten)]
         d: DaemonArgs,
     },
+    /// Install the service and web UI on this box, and set the admin password. Works with or
+    /// without root. Safe to run again.
+    Setup {
+        /// The only local folder transfers can use. Asked for on a terminal if not given.
+        #[arg(long, value_name = "DIR")]
+        folder: Option<String>,
+        /// Port for the web UI on 127.0.0.1. Without it, the first free port from 7890.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Read the admin password from a line on standard input, for scripts.
+        #[arg(long)]
+        password_stdin: bool,
+        /// No animation or colour.
+        #[arg(long)]
+        plain: bool,
+    },
+    /// Show whether the service is running.
+    Status,
+    /// Start the service.
+    Start,
+    /// Stop the service.
+    Stop,
+    /// Restart the service.
+    Restart,
+    /// Show the service's log, and keep following it.
+    Logs {
+        /// Print the latest lines and exit.
+        #[arg(long)]
+        no_follow: bool,
+    },
+    /// Remove the service and the binary. Your files and settings stay.
+    Uninstall {
+        /// Also delete the settings, saved servers and keys.
+        #[arg(long)]
+        purge: bool,
+        /// Do not ask first.
+        #[arg(long)]
+        yes: bool,
+        /// No animation or colour.
+        #[arg(long)]
+        plain: bool,
+    },
 }
 
 #[derive(Args)]
@@ -281,6 +323,34 @@ async fn run(cli: Cli) -> Result<(), Error> {
         }
         Cmd::Hosts { cmd } => hosts(&known_path, cmd.clone()).await,
         Cmd::Serve(a) => serve(a).await,
+        Cmd::Setup {
+            folder,
+            port,
+            password_stdin,
+            plain,
+        } => {
+            let o = hopsync::setup::SetupOptions {
+                folder: folder.clone(),
+                port: *port,
+                password_stdin: *password_stdin,
+                plain: *plain,
+            };
+            on_blocking_thread(move || hopsync::setup::run_setup(&o)).await
+        }
+        Cmd::Status => control(hopsync::setup::Control::Status).await,
+        Cmd::Start => control(hopsync::setup::Control::Start).await,
+        Cmd::Stop => control(hopsync::setup::Control::Stop).await,
+        Cmd::Restart => control(hopsync::setup::Control::Restart).await,
+        Cmd::Logs { no_follow } => {
+            control(hopsync::setup::Control::Logs {
+                follow: !*no_follow,
+            })
+            .await
+        }
+        Cmd::Uninstall { purge, yes, plain } => {
+            let (purge, yes, plain) = (*purge, *yes, *plain);
+            on_blocking_thread(move || hopsync::setup::run_uninstall(purge, yes, plain)).await
+        }
         Cmd::Jobs { state, d } => jobs(d, state.as_deref()).await,
         Cmd::Queue {
             direction,
@@ -445,6 +515,24 @@ async fn jobs(d: &DaemonArgs, state: Option<&str>) -> Result<(), Error> {
         print_job(j);
     }
     Ok(())
+}
+
+/// Runs terminal work off the async threads, and puts the cursor back if Ctrl-C ends it.
+async fn on_blocking_thread(
+    f: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Result<(), Error> {
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            hopsync::ui::restore_terminal();
+            std::process::exit(130);
+        }
+    });
+    tokio::task::spawn_blocking(f).await??;
+    Ok(())
+}
+
+async fn control(what: hopsync::setup::Control) -> Result<(), Error> {
+    on_blocking_thread(move || hopsync::setup::control(what)).await
 }
 
 async fn serve(a: &ServeArgs) -> Result<(), Error> {

@@ -1,6 +1,6 @@
 # Hopsync: Design & Plan
 
-**Status:** approved by owner 2026-11-03; Phases 0 and 1 done, Phase 2 done (2026-11-04), Phase 3 done (2026-11-04), web UI moved to React (2026-11-04, `docs/plans/2026-11-04-react-ui-plan.md`); Phase 4 started (2026-11-06: CI and release binaries done)
+**Status:** approved by owner 2026-11-03; Phases 0 and 1 done, Phase 2 done (2026-11-04), Phase 3 done (2026-11-04), web UI moved to React (2026-11-04, `docs/plans/2026-11-04-react-ui-plan.md`); Phase 4 started (2026-11-06: CI and release binaries done; 2026-11-07: one-line install and `hopsync setup`)
 **Language:** Rust
 **License:** MIT OR Apache-2.0
 **Rules:** every contributor and agent follows `CLAUDE.md` in this folder.
@@ -255,6 +255,7 @@ Notes and results: `docs/phase0/`.
 - Done 2026-11-06: CI that runs the audits, tests and browser run, and release builds with
   `HOPSYNC_REQUIRE_UI=1`; binaries for x86_64, aarch64 and armv7; signed build records.
 - TLS, rate limiting, audit log, fuzzing of path/listing parsing, systemd sandboxing.
+- Done 2026-11-07: one-line install and `hopsync setup` for every kind of box (`docs/phase4/install-security-review.md`).
 - AUR, `.deb`, Docker image, docs, benchmark page.
 - Passphrase-protected keys or `ssh-agent`, and RSA if users ask for it after the advisory below.
 
@@ -346,6 +347,13 @@ Notes and results: `docs/phase0/`.
 | 2026-11-06 | Actions pinned by commit hash; the job that builds has read-only access and the job that can write runs no repository code | A moved tag or a poisoned build script must not reach release publishing (CLAUDE.md §3). No dependency caches in the release job, for the same reason. |
 | 2026-11-06 | A held queue and a stop pressed on a running job are saved in the store (schema 2), and a restart honors both | Both lived only in memory, so a restart started a held queue, and a daemon that died in the moment after a pause or cancel ran that job again (found by a TLA+ model, then reproduced on the binary). The stop is a new column, not a new state: the job really is still running until the transfer reports back, and a transfer that ends first keeps its real result. Cost: a binary from before schema 2 refuses this database. |
 | 2026-11-06 | pnpm 9 is refused through `engines`, not supported | pnpm 9 ignores `minimumReleaseAge`, so letting it install would quietly drop the 14-day rule. `packages` in the workspace file exists so pnpm 9 reaches the `engines` check instead of a confusing parse error. Corepack is no help: Node 25 and later do not ship it. |
+
+| 2026-11-07 | Install is `curl`/`wget` piped to `install.sh`, then `hopsync setup` | Owner's choice. The script only places the binary, so setup can ask its questions on a real terminal, which a script read from a pipe cannot do reliably. It is a release file, so it matches the archives beside it, and it verifies them against `sha256sums.txt`. |
+| 2026-11-07 | Setup picks one of three modes: system unit, user unit, or a detached process with a cron `@reboot` line | Boxes differ. Servarica has root and systemd; Seedhost (measured over SSH) has neither root nor `systemctl --user`, but has cron. A mode that only printed an error would leave shared seedboxes out, and they are a main target. `hopsync status`, `start`, `stop`, `restart` and `logs` work the same in all three. |
+| 2026-11-07 | Setup sets the password through the daemon's own `/api/setup`, after checking the port's owner in `/proc/net/tcp` | No second way to set a password, so hashing, rules and audit stay in one place, and root never has to create files the service account owns. On a shared box another customer can listen on a loopback port, so the port must belong to the service's uid before the password is sent. |
+| 2026-11-07 | Setup's terminal output is written here on `rustix` termios, not `cliclack` or `indicatif` + `rpassword` | Compared on 2026-11-07: all are maintained (cliclack 0.5.7, indicatif 0.18.6, rpassword 7.5.4; MIT or Apache-2.0). In a clean project, `cliclack` pulls 58 crates including the ICU stack, and `indicatif` + `rpassword` pull 9 and offer no hop animation. CLAUDE.md prefers fewer dependencies, and this needs only ANSI codes and raw input, in about 300 lines with `rustix`, already a dependency. |
+| 2026-11-07 | Setup refuses folders with spaces or other shell, unit-file or cron characters | Each of those formats escapes differently, and one mistake is a command injection. A plain allowlist cannot get that wrong. A symlink covers the rare folder with a space. |
+| 2026-11-07 | A system service runs as the owner of an existing folder, or the `hopsync` account for a new one, and a root-owned folder is refused | Never root (CLAUDE.md section 3). Setup never runs `chown -R` on existing files unasked: on a seedbox those can be terabytes another program is using. |
 
 ## 11. Open questions (owner to decide)
 
