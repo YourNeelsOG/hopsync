@@ -45,6 +45,8 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
+# SQLite calls fchown on its journal files when it runs as root.
+SystemCallFilter=@chown
 
 [Install]
 WantedBy=multi-user.target

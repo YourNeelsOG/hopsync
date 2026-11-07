@@ -2176,6 +2176,13 @@ mod tests {
         );
         assert!(u.contains("NoNewPrivileges=yes"));
         assert!(u.contains("UMask=0022"));
+        // SQLite calls fchown on its journal files when it runs as root. Without this the filter
+        // kills the daemon at its first write.
+        let (denied, allowed) = (
+            u.find("SystemCallFilter=~@privileged").unwrap(),
+            u.find("SystemCallFilter=@chown\n").expect("chown allowed"),
+        );
+        assert!(denied < allowed, "a later line must add it back");
     }
 
     #[test]
