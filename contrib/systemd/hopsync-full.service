@@ -1,0 +1,52 @@
+# System unit for full access: `hopsync setup --full-access` installs this with your values.
+# The service runs as root over the whole box, so anyone with the web UI password controls this
+# server. The default unit, hopsync.service, runs as an unprivileged user in one folder.
+
+[Unit]
+Description=Hopsync file transfer service (full access)
+Documentation=https://github.com/YourNeelsOG/hopsync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# Named so that systemd sets HOME, which the daemon needs.
+User=root
+Group=root
+ExecStart=/usr/local/bin/hopsync serve --listen 127.0.0.1:7890 --data-dir /var/lib/hopsync/data --root / --full-access --socket /run/hopsync/hopsync.sock
+Restart=on-failure
+RestartSec=5s
+# A job interrupted by a stop resumes from its journal on the next start.
+TimeoutStopSec=30s
+
+StateDirectory=hopsync
+StateDirectoryMode=0700
+RuntimeDirectory=hopsync
+RuntimeDirectoryMode=0700
+# Other programs on the box must be able to read what Hopsync writes.
+UMask=0022
+
+# It needs every file, not the kernel: root's other powers stay out of reach.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# SQLite calls fchown on its journal files when it runs as root.
+SystemCallFilter=@chown
+
+[Install]
+WantedBy=multi-user.target

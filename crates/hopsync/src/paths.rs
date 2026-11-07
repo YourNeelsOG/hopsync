@@ -11,7 +11,7 @@
 use std::fmt;
 
 mod local;
-pub use local::{DirEntry, EntryKind, LocalRoot, OpenMode};
+pub use local::{DirEntry, EntryKind, Hidden, LocalRoot, OpenMode};
 
 /// Linux NAME_MAX. Longer names cannot be created locally on common filesystems.
 pub const NAME_MAX_BYTES: usize = 255;
@@ -104,6 +104,11 @@ impl RelPath {
 
     pub fn components(&self) -> &[Name] {
         &self.0
+    }
+
+    /// The components before the last one: the folders on the way to this path.
+    pub fn parents(&self) -> &[Name] {
+        self.0.split_last().map_or(&[], |(_, parents)| parents)
     }
 
     /// "a/b/c", or "" for the root.

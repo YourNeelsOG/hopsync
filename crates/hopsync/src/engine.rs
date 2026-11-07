@@ -209,7 +209,12 @@ impl Remote {
         loop {
             let was_warm = self.warm.lock().is_ok_and(|w| w.is_some());
             let sftp = connect_session(self, opts).await?;
-            match sftp.read_dir(&path).await {
+            // read_dir follows a link, so here the last name counts as well.
+            let listed = match refuse_links_in(&sftp, &self.root, rel.components()).await {
+                Ok(()) => sftp.read_dir(&path).await.map_err(TransferError::from),
+                Err(e) => Err(e),
+            };
+            match listed {
                 Ok(entries) => {
                     if let Ok(mut warm) = self.warm.lock() {
                         *warm = Some(sftp);
@@ -217,7 +222,6 @@ impl Remote {
                     return Ok(entries);
                 }
                 Err(e) => {
-                    let e = TransferError::from(e);
                     if was_warm && !fresh_tried && is_transient(&e) {
                         fresh_tried = true;
                         continue;
@@ -349,6 +353,8 @@ pub enum TransferError {
     },
     /// The retry budget ran out; carries the last transient error.
     RetriesExhausted(SftpError),
+    /// A folder on the way to a remote path is a symlink, which could lead out of the root.
+    SymlinkOnTheWay(String),
     /// `TransferOptions::cancel` was set.
     Cancelled,
 }
@@ -376,6 +382,7 @@ impl fmt::Display for TransferError {
                 "{path}: verify failed: the destination differs from the source in the chunk at byte {offset}"
             ),
             Self::RetriesExhausted(e) => write!(f, "giving up after repeated failures: {e}"),
+            Self::SymlinkOnTheWay(p) => write!(f, "{p} is a symlink, which is not followed"),
             Self::Cancelled => f.write_str("cancelled"),
         }
     }
@@ -469,6 +476,30 @@ fn join_label(dir: &str, name: &str) -> String {
     }
 }
 
+/// Refuses a remote path if any of `names`, walked down from the root, is a symlink: it could lead
+/// out of the root. SFTP cannot open a path "beneath" a folder, so each one is looked at. A missing
+/// folder ends the walk, and the operation that follows reports it. The root itself is the user's
+/// choice and is not checked.
+pub async fn refuse_links_in(
+    sftp: &Sftp,
+    root: &RemoteRoot,
+    names: &[Name],
+) -> Result<(), TransferError> {
+    let mut at = RelPath::default();
+    for name in names {
+        at = at.join(name.clone());
+        match sftp.lstat(&root.join(&at)).await {
+            Ok(a) if a.kind == RemoteKind::Symlink => {
+                return Err(TransferError::SymlinkOnTheWay(at.to_slash_string()));
+            }
+            Ok(_) => {}
+            Err(SftpError::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
 // Entry points.
 
 /// Copies local file `src` to remote `dst` (both relative to their roots).
@@ -486,6 +517,7 @@ pub async fn push_file(
     }
     check_cancel(opts)?;
     let first = connect_session(remote, opts).await?;
+    refuse_links_in(&first, &remote.root, dst.parents()).await?;
     let found = |rel: RelPath| {
         let (sftp, path) = (first.clone(), remote.root.join(&rel));
         async move {
@@ -517,6 +549,7 @@ pub async fn push_file(
         Direction::Push,
         remote,
         local,
+        &RelPath::default(),
         opts,
         lanes,
         1,
@@ -540,6 +573,7 @@ pub async fn pull_file(
 ) -> Result<FileReport, TransferError> {
     check_cancel(opts)?;
     let first = connect_session(remote, opts).await?;
+    refuse_links_in(&first, &remote.root, src.parents()).await?;
     let src_path = remote.root.join(src);
     let attrs = first.lstat(&src_path).await?;
     if attrs.kind != RemoteKind::File {
@@ -569,6 +603,7 @@ pub async fn pull_file(
         Direction::Pull,
         remote,
         local,
+        &dst,
         opts,
         lanes,
         1,
@@ -689,6 +724,8 @@ pub async fn push_tree(
 ) -> Result<TreeReport, TransferError> {
     check_cancel(opts)?;
     let first = connect_session(remote, opts).await?;
+    // mkdir refuses a link at `dst` itself.
+    refuse_links_in(&first, &remote.root, dst.parents()).await?;
     let top = remote.root.join(dst);
     if !opts.dry_run {
         first.mkdir(&top).await.map_err(|e| match e {
@@ -705,6 +742,7 @@ pub async fn push_tree(
         Direction::Push,
         remote,
         local,
+        &RelPath::default(),
         opts,
         lanes,
         per_lane,
@@ -724,6 +762,7 @@ pub async fn pull_tree(
 ) -> Result<TreeReport, TransferError> {
     check_cancel(opts)?;
     let first = connect_session(remote, opts).await?;
+    refuse_links_in(&first, &remote.root, src.parents()).await?;
     let src_path = remote.root.join(src);
     if first.lstat(&src_path).await?.kind != RemoteKind::Dir {
         return Err(TransferError::NotAFile(src_path));
@@ -741,6 +780,7 @@ pub async fn pull_tree(
         Direction::Pull,
         remote,
         local,
+        &dst.clone(),
         opts,
         lanes,
         per_lane,
@@ -1384,6 +1424,8 @@ async fn run<P, Fut>(
     dir: Direction,
     remote: &Remote,
     local: &LocalRoot,
+    // Where a pull writes: a local root of `/` can hold many filesystems.
+    pull_dst: &RelPath,
     opts: &TransferOptions,
     (lanes, max_lanes): (usize, usize),
     per_lane: usize,
@@ -1415,7 +1457,7 @@ where
         Direction::Push => first.available_bytes(remote.root.as_str()).await?,
         Direction::Pull => Some(
             local
-                .available_bytes()
+                .available_bytes(pull_dst)
                 .map_err(local_err(&local.path().display().to_string()))?,
         ),
     };
@@ -1543,7 +1585,8 @@ where
             .try_clone()
             .map_err(local_err(&local.path().display().to_string()))?;
         let path = local.path().display().to_string();
-        blocking(move || root.sync_fs())
+        let synced = pull_dst.clone();
+        blocking(move || root.sync_fs(&synced))
             .await
             .map_err(local_err(&path))?;
     }

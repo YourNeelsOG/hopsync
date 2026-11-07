@@ -60,7 +60,7 @@ class Run:
         self.row(side, name).get_by_role("checkbox").check()
 
     def transfer(self, button="Upload", policy=None):
-        self.p.get_by_role("button", name=button).click()
+        self.p.get_by_role("button", name=button, exact=True).click()
         dialog = self.p.locator("dialog[open]")
         expect(dialog).to_be_visible()
         if policy:
@@ -118,6 +118,7 @@ def add_servers(r):
     d.locator("input[name=host]").fill("127.0.0.1")
     d.locator("input[name=port]").fill(str(w.ssh_port))
     d.locator("input[name=root]").fill("/tmp")
+    d.get_by_label("Generate a key, and add it to the server myself").check()
     d.get_by_role("button", name="Add", exact=True).click()
     d = p.locator("dialog[open]")
     # The same key was pinned for the other server on this host and port, so it may match at once.
@@ -156,7 +157,7 @@ def browse(r):
     step("a hostile file name is shown as text")
 
     expect(r.row("right", "only-on-server.txt")).to_be_visible()
-    expect(p.get_by_role("button", name="Upload")).to_be_disabled()
+    expect(p.get_by_role("button", name="Upload", exact=True)).to_be_disabled()
 
     left.get_by_role("button", name="Datasets", exact=True).click()
     expect(r.row("left", "wikipedia-en")).to_be_visible()
@@ -194,7 +195,7 @@ def transfers(r):
     step("upload: preview first, then the file appears on the right with no manual refresh")
 
     r.select("left", "notes.txt")
-    p.get_by_role("button", name="Upload").click()
+    p.get_by_role("button", name="Upload", exact=True).click()
     d = p.locator("dialog[open]")
     # One existing file under Skip: the daemon refuses it in the preview, and nothing can be queued.
     expect(d.get_by_text("destination exists")).to_be_visible(timeout=15000)
@@ -219,6 +220,28 @@ def transfers(r):
     d.get_by_role("button", name="Cancel").click()
     r.row("left", "zero-byte.txt").get_by_role("checkbox").uncheck()
     step("dragging a row between panes opens the same dialog")
+
+
+def browser_files(r):
+    w, p = r.w, r.p
+    data = bytes(i % 251 for i in range(3_000_000))
+    for side, folder in (("right", w.remote), ("left", w.local)):
+        pane = p.locator(f"#pane-{side}")
+        name = f"from-computer-{side}.bin"
+        pane.get_by_label("Files to upload").set_input_files(
+            {"name": name, "mimeType": "application/octet-stream", "buffer": data}
+        )
+        expect(r.row(side, name)).to_be_visible(timeout=15000)
+        assert (folder / name).read_bytes() == data, f"{side}: the file arrived changed"
+
+        r.select(side, name)
+        with p.expect_download() as saved:
+            pane.get_by_role("button", name="Save to this computer").click()
+        assert saved.value.suggested_filename == name
+        with open(saved.value.path(), "rb") as f:
+            assert f.read() == data, f"{side}: the saved file changed"
+        r.row(side, name).get_by_role("checkbox").uncheck()
+    step("files upload from and save to this computer, on this box and on a server")
 
 
 def live_speed(r):
@@ -438,6 +461,7 @@ def main():
             add_servers(r)
             browse(r)
             transfers(r)
+            browser_files(r)
             live_speed(r)
             queue(r)
             changed_host_key(r)

@@ -92,3 +92,29 @@ Accepted risks of public mode:
 - **SELinux enforcing was not tested.** The Rocky 9 run was in a container, where it is not enforced.
 - **The published install URL has not run yet.** It needs a release. The tests use a local mirror, and
   the release workflow's new steps have not run on GitHub.
+- **Full access is a deliberate exception, chosen by the owner (plan.md Decision log).** It is off by
+  default, an upgrade never gains it, and a script that says nothing never gains it. On a root box a
+  web UI login can write anywhere, including `/etc/cron.d`, which amounts to running commands as root.
+  The unit limits root to file access (`CapabilityBoundingSet`, `NoNewPrivileges`) and keeps the kernel
+  protections, but that does not stop a write to a system file. Setup and the daemon log both say full
+  access is on.
+- **Full access without root blocks hidden entries in the home folder.** `LocalRoot` enforces this on
+  every path-taking call, so listing, reading, writing and renaming all refuse them, and it covers
+  Hopsync's own settings in `~/.config` and secrets in `~/.local`, so a web UI login cannot turn the
+  mode off or read the vault. A file such as `~/bin/x` that the shell runs can still be overwritten.
+- **The settings file is trusted as much as the unit.** It is root-owned with mode 0600 on a root box,
+  and its folder goes through the same checks as a typed answer.
+- **Browser file routes follow the same rules as the rest of the API.** `GET` and `PUT` on
+  `/api/local/file` and `/api/servers/{id}/file` need a session, `PUT` needs the same origin and `application/octet-stream`, which a cross-site form
+  cannot send without a preflight, and only these routes accept that type. Local paths pass through
+  `LocalRoot`, so roots, symlinks and hidden entries apply. Server paths stay under that server's root
+  folder, a blocked host key refuses them, and neither a symlink at the path, in a parent folder, nor at
+  the part file's name is followed.
+- **Server paths a caller supplies do not pass through a symlink.** Browsing, push, pull and dry runs check
+  each folder on the way with `lstat` (`engine::refuse_links_in`), and browsing checks the last name too. SFTP
+  has no equivalent of `openat2(RESOLVE_BENEATH)`, so a link created between the check and the use is not
+  caught; the server account could reach that target over SSH anyway. Known gap: a job's part file is opened
+  without checking for a planted link, because that check would add a round trip per pushed file. Downloads are `attachment` with `nosniff`, and the name is
+  percent-encoded, so a hostile file name cannot add a header or run as a page. Both are in the audit log.
+- **A password typed in Add server is sent only after the host key is trusted**, in the one login call,
+  and is never stored or logged.
