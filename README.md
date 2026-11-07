@@ -116,7 +116,27 @@ Then start the service and web UI, and choose a password:
 hopsync setup
 ```
 
-Setup prints the command that opens the web UI from your own PC. Check on the service with:
+To install an older release, set its tag. Every release stays available on the
+[releases page](https://github.com/YourNeelsOG/hopsync/releases):
+
+```bash
+curl -fsSL https://github.com/YourNeelsOG/hopsync/releases/latest/download/install.sh | HOPSYNC_VERSION=v1.0.0 sh
+```
+
+Setup prints the command that opens the web UI from your own PC. The web UI listens only on
+`127.0.0.1` of the server, so `http://<server-ip>:7890` is refused on purpose: it has no TLS, and
+the connection would carry your password in plain text. Open it through the SSH tunnel:
+
+```bash
+ssh -N -L 7890:127.0.0.1:7890 user@your-server
+```
+
+Then go to `http://127.0.0.1:7890`.
+
+Setup asks which folder Hopsync may use. It refuses a home folder, because writing to `~/.ssh` or
+`~/.bashrc` would let a web UI login run commands. Choose a subfolder such as `~/downloads`.
+
+Check on the service with:
 
 ```bash
 systemctl status hopsync

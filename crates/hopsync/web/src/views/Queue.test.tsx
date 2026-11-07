@@ -63,6 +63,13 @@ afterEach(() => {
 });
 
 describe("a job row during a transfer", () => {
+  it("calls files it left alone skipped, not problems", () => {
+    show();
+    act(() => emit({ changes: 1, queue_paused: false, running: [{ ...progress(100), problems: 3 }] }));
+    expect(screen.getByText("3 skipped or failed")).toBeTruthy();
+    expect(screen.queryByText(/problems/)).toBeNull();
+  });
+
   it("keeps the same buttons and focus while progress updates arrive", () => {
     show();
     act(() => emit({ changes: 1, queue_paused: false, running: [progress(100)] }));

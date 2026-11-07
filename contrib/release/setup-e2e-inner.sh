@@ -126,8 +126,14 @@ shared_box() {
     runuser -u dave -- python3 -m http.server 7890 --bind 127.0.0.1 >/dev/null 2>&1 &
     sleep 1
 
+    # Writing to ~/.ssh or ~/.bashrc is running commands, so a whole home is never the folder.
+    runuser -u carol -- mkdir -p /home/carol/.ssh
+    out=$(printf '%s\n' "$PW" | as_carol hopsync setup --plain --password-stdin --folder /home/carol 2>&1); rc=$?
+    [ "$rc" -ne 0 ] && echo "$out" | grep -q 'subfolder' && ok "a home folder is refused, with the fix" || bad "home folder: rc=$rc $out"
+
     out=$(printf '%s\n' "$PW" | as_carol hopsync setup --plain --password-stdin 2>&1); rc=$?
     [ "$rc" -eq 0 ] && ok "setup succeeds without root or systemd" || bad "setup failed: $out"
+    check "the default folder is its own subfolder" "test -d /home/carol/hopsync && pgrep -u carol -af hopsync | grep -q -- '--root /home/carol/hopsync'"
     echo "$out" | grep -q 'hopsync status' && ok "prints hopsync status" || bad "no status command: $out"
     echo "$out" | grep -q 'sudo' && ok "mentions the sudo option" || bad "no sudo hint: $out"
     echo "$out" | grep -q 'ssh -L 7891:127.0.0.1:7891' && ok "skips the other customer's port" || bad "port: $out"
@@ -150,7 +156,8 @@ shared_box() {
     [ "$pid" = "$(pgrep -u carol -x hopsync)" ] && ok "a second setup does not restart it" || bad "second setup restarted it"
     [ "$(as_carol crontab -l | grep -c '@reboot.*hopsync start')" = 1 ] && ok "cron has one line after two setups" || bad "duplicate cron line"
 
-    check "hopsync stop works" "as_carol hopsync stop && ! pgrep -u carol -x hopsync"
+    check "hopsync stop says so" "as_carol hopsync stop | grep -q 'hopsync: stopped'"
+    check "hopsync stop works" "! pgrep -u carol -x hopsync"
     check "hopsync status says stopped" "as_carol hopsync status | grep -qi stopped"
     check "stop twice is fine" "as_carol hopsync stop"
     check "hopsync start works" "as_carol hopsync start && pgrep -u carol -x hopsync"
@@ -173,6 +180,7 @@ shared_box() {
     as_carol hopsync start
     out=$(as_carol hopsync uninstall --plain --yes 2>&1); rc=$?
     [ "$rc" -eq 0 ] && ok "uninstall works" || bad "uninstall: $out"
+    echo "$out" | grep -q 'rm -rf /home/carol/.local/share/hopsync' && ok "uninstall gives a command that works without the binary" || bad "no delete command: $out"
     check "uninstall stopped it" "! pgrep -u carol -x hopsync"
     check "uninstall removed only its cron line" "! as_carol crontab -l | grep -q hopsync && as_carol crontab -l | grep -q '# mine'"
     check "uninstall kept the data" "test -d /home/carol/.local/share/hopsync"

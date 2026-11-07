@@ -356,6 +356,9 @@ Notes and results: `docs/phase0/`.
 | 2026-11-07 | A system service runs as the owner of an existing folder, or the `hopsync` account for a new one, and a root-owned folder is refused | Never root (CLAUDE.md section 3). Setup never runs `chown -R` on existing files unasked: on a seedbox those can be terabytes another program is using. |
 
 | 2026-11-07 | First release is `v1.0.0`, tagged `v1.0.0` and titled "prod v1.0.0" | Owner's choice, ahead of the Phase 5 plan and with built-in TLS, fuzzing, packages and an independent security review still open (README, Project status). The release workflow accepts only `vX.Y.Z` tags that match `Cargo.toml`, so a tag named `prodV1.0.0` would not start it. |
+| 2026-11-07 | `hopsync setup` refuses a folder holding `.ssh`, the home, or the data folder; default without root is `~/hopsync` | Real test on Seedhost: v1.0.0 defaulted to the whole home, so a web login could write `authorized_keys` and `.bashrc`, which is running commands (`CLAUDE.md` section 3). A subfolder such as `~/downloads` works, and `~` is understood at the prompt. |
+| 2026-11-07 | Call glibc `malloc_trim` after each job and each login | Real test on Servarica: 105 MiB stayed in glibc arenas when idle after a 2 GiB push, against 1.3 MiB before it. Compared: a fixed `M_MMAP_THRESHOLD` (needs a call at start, and leaves Argon2 and SSH buffers in arenas), and mimalloc or jemalloc (a new dependency, more than this needs). `libc` is already a dependency. |
+| 2026-11-07 | Drop a source file's whole page range when its reader closes | Real test: 44 MiB of a 2 GiB source stayed cached after the job, because read-ahead from one lane brought back ranges another lane had dropped. |
 
 ## 11. Open questions (owner to decide)
 
