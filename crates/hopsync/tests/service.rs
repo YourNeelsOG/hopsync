@@ -29,16 +29,32 @@ fn env() -> Option<Env> {
     })
 }
 
+/// Opens a data folder that a dropped service used. A real restart ends the process, which frees the
+/// lock at once. In a test the lock can outlive the drop for a moment: a background task may hold the
+/// last reference, and a process another test is forking holds a copy of the descriptor until it
+/// execs. So a refusal is retried briefly. A lock that is never freed still fails.
+fn open_once_free(config: impl Fn() -> ServiceConfig) -> Arc<Service> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match Service::open(config()) {
+            Err(ServiceError::Conflict(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => break other.expect("open service"),
+        }
+    }
+}
+
 impl Env {
+    /// Opens the service, as a restart would.
     fn open(&self) -> Arc<Service> {
-        let svc = Service::open(ServiceConfig {
+        let svc = open_once_free(|| ServiceConfig {
             data_dir: self.data.path().join("data"),
             local_root: self.local.path().to_owned(),
             hidden: Default::default(),
             concurrency: 1,
             ssh: SshOptions::default(),
-        })
-        .expect("open service");
+        });
         svc.start();
         svc
     }
@@ -776,7 +792,7 @@ async fn a_second_daemon_on_the_same_data_dir_is_refused() {
         "the refused daemon touched nothing"
     );
     drop(first);
-    Service::open(config()).expect("open after the first one is gone");
+    open_once_free(config);
 }
 
 #[tokio::test(flavor = "multi_thread")]
