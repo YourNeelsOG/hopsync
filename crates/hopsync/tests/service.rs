@@ -34,6 +34,7 @@ impl Env {
         let svc = Service::open(ServiceConfig {
             data_dir: self.data.path().join("data"),
             local_root: self.local.path().to_owned(),
+            hidden: Default::default(),
             concurrency: 1,
             ssh: SshOptions::default(),
         })
@@ -460,12 +461,220 @@ async fn an_idle_browse_connection_is_closed_and_reopens_on_demand() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn full_access_on_a_home_folder_keeps_hidden_entries_out_of_every_transfer() {
+    let Some(e) = env() else { return };
+    let home = e.local.path();
+    std::fs::create_dir(home.join(".ssh")).expect("mkdir");
+    std::fs::write(home.join(".ssh/authorized_keys"), b"mine").expect("write");
+    std::fs::write(home.join(".bashrc"), b"mine").expect("write");
+    std::fs::create_dir(home.join("media")).expect("mkdir");
+    std::fs::write(home.join("media/movie"), b"film").expect("write");
+    std::fs::write(e.remote_dir().join("payload"), b"evil").expect("write");
+
+    let svc = Service::open(ServiceConfig {
+        data_dir: e.data.path().join("data"),
+        local_root: home.to_owned(),
+        hidden: hopsync::paths::Hidden::for_full_access(home),
+        concurrency: 1,
+        ssh: SshOptions::default(),
+    })
+    .expect("open service");
+    svc.start();
+    let id = trusted(&svc, &e, "a").await;
+
+    let listed: Vec<String> = svc
+        .list_local("")
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|en| en.name)
+        .collect();
+    assert_eq!(listed, ["media"]);
+    assert!(svc.list_local(".ssh").await.is_err());
+
+    let visible = svc.add_job(&push(id, "media", "media")).expect("queue");
+    let job = wait_for(&svc, visible.id, |j| j.state == JobState::Done).await;
+    assert_eq!(job.state, JobState::Done);
+    assert_eq!(
+        std::fs::read(e.remote_dir().join("media/movie")).expect("sent"),
+        b"film"
+    );
+
+    // Refused when queued or when run: either way nothing moves.
+    if let Ok(j) = svc.add_job(&push(id, ".ssh/authorized_keys", "stolen")) {
+        wait_for(&svc, j.id, |j| j.state == JobState::Failed).await;
+    }
+    assert!(!e.remote_dir().join("stolen").exists());
+
+    let mut overwrite = push(id, "payload", ".bashrc");
+    overwrite.direction = Direction::Pull;
+    overwrite.existing = "overwrite".into();
+    if let Ok(j) = svc.add_job(&overwrite) {
+        wait_for(&svc, j.id, |j| j.state == JobState::Failed).await;
+    }
+    assert_eq!(std::fs::read(home.join(".bashrc")).expect("read"), b"mine");
+}
+
+fn browser_body(
+    data: &[u8],
+) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Unpin + use<> {
+    let pieces: Vec<_> = data
+        .chunks(37_000)
+        .map(|c| Ok(axum::body::Bytes::copy_from_slice(c)))
+        .collect();
+    futures_util::stream::iter(pieces)
+}
+
+async fn remote_bytes(d: &hopsync::service::RemoteDownload) -> Vec<u8> {
+    let mut out = vec![0u8; usize::try_from(d.size).expect("size")];
+    let n = d.file.read_at(0, &mut out).await.expect("read");
+    out.truncate(n);
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_browser_can_upload_to_and_save_from_a_connected_server() {
+    let Some(e) = env() else { return };
+    let svc = e.open();
+    let id = trusted(&svc, &e, "a").await;
+    std::fs::create_dir(e.remote_dir().join("in")).expect("mkdir");
+    // Longer than many blocks, with content that shows any block out of place.
+    let data: Vec<u8> = (0..5_000_000u32).map(|i| (i % 251) as u8).collect();
+
+    let n = svc
+        .upload_remote(
+            id,
+            "in/a b.bin",
+            false,
+            Some(data.len() as u64),
+            browser_body(&data),
+        )
+        .await
+        .expect("upload");
+    assert_eq!(n, data.len() as u64);
+    assert_eq!(
+        std::fs::read(e.remote_dir().join("in/a b.bin")).expect("arrived"),
+        data
+    );
+    assert_eq!(
+        std::fs::read_dir(e.remote_dir().join("in"))
+            .expect("list")
+            .count(),
+        1
+    );
+
+    let d = svc
+        .open_remote_download(id, "in/a b.bin")
+        .await
+        .expect("open");
+    assert_eq!((d.size, d.name.as_str()), (data.len() as u64, "a b.bin"));
+    assert_eq!(remote_bytes(&d).await, data);
+
+    // An existing file needs a clear yes.
+    assert!(matches!(
+        svc.upload_remote(id, "in/a b.bin", false, Some(1), browser_body(b"x"))
+            .await,
+        Err(ServiceError::Conflict(_))
+    ));
+    assert_eq!(
+        std::fs::read(e.remote_dir().join("in/a b.bin")).expect("kept"),
+        data
+    );
+    svc.upload_remote(id, "in/a b.bin", true, Some(1), browser_body(b"x"))
+        .await
+        .expect("replace");
+    assert_eq!(
+        std::fs::read(e.remote_dir().join("in/a b.bin")).expect("new"),
+        b"x"
+    );
+
+    // An empty file is a file too.
+    svc.upload_remote(id, "empty", false, Some(0), browser_body(b""))
+        .await
+        .expect("empty");
+    assert_eq!(
+        std::fs::read(e.remote_dir().join("empty")).expect("empty"),
+        b""
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_transfers_to_a_server_stay_in_its_root_folder() {
+    let Some(e) = env() else { return };
+    let svc = e.open();
+    let id = trusted(&svc, &e, "a").await;
+    let outside = e.sshd.dir().join("outside");
+    std::fs::write(&outside, b"secret").expect("write");
+    std::os::unix::fs::symlink(&outside, e.remote_dir().join("link")).expect("symlink");
+    std::fs::create_dir(e.remote_dir().join("dir")).expect("mkdir");
+
+    assert!(matches!(
+        svc.open_remote_download(id, "../outside").await,
+        Err(ServiceError::BadRequest(_))
+    ));
+    assert!(matches!(
+        svc.upload_remote(id, "../escaped", false, Some(1), browser_body(b"x"))
+            .await,
+        Err(ServiceError::BadRequest(_))
+    ));
+    assert!(!e.sshd.dir().join("escaped").exists());
+    assert!(matches!(
+        svc.open_remote_download(id, "link").await,
+        Err(ServiceError::BadRequest(_))
+    ));
+    assert!(matches!(
+        svc.open_remote_download(id, "dir").await,
+        Err(ServiceError::BadRequest(_))
+    ));
+    assert!(matches!(
+        svc.open_remote_download(id, "missing").await,
+        Err(ServiceError::NotFound)
+    ));
+    assert!(matches!(
+        svc.upload_remote(id, "dir", true, Some(1), browser_body(b"x"))
+            .await,
+        Err(ServiceError::Conflict(_))
+    ));
+    assert!(
+        svc.upload_remote(id, "no/such/file", false, Some(1), browser_body(b"x"))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_upload_to_a_server_leaves_nothing_behind() {
+    let Some(e) = env() else { return };
+    let svc = e.open();
+    let id = trusted(&svc, &e, "a").await;
+    let cut = futures_util::stream::iter(vec![
+        Ok(axum::body::Bytes::from(vec![7u8; 600_000])),
+        Err(std::io::Error::other("the browser went away")),
+    ]);
+    assert!(
+        svc.upload_remote(id, "cut.bin", false, Some(9_000_000), cut)
+            .await
+            .is_err()
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::fs::read_dir(e.remote_dir()).expect("list").count() != 0 {
+        assert!(std::time::Instant::now() < deadline, "the part file stayed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The name is free again.
+    svc.upload_remote(id, "cut.bin", false, Some(1), browser_body(b"x"))
+        .await
+        .expect("retry");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_second_daemon_on_the_same_data_dir_is_refused() {
     let data = tempfile::tempdir().expect("tempdir");
     let local = tempfile::tempdir().expect("tempdir");
     let config = || ServiceConfig {
         data_dir: data.path().join("data"),
         local_root: local.path().to_owned(),
+        hidden: Default::default(),
         concurrency: 1,
         ssh: SshOptions::default(),
     };

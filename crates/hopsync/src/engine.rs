@@ -517,6 +517,7 @@ pub async fn push_file(
         Direction::Push,
         remote,
         local,
+        &RelPath::default(),
         opts,
         lanes,
         1,
@@ -569,6 +570,7 @@ pub async fn pull_file(
         Direction::Pull,
         remote,
         local,
+        &dst,
         opts,
         lanes,
         1,
@@ -705,6 +707,7 @@ pub async fn push_tree(
         Direction::Push,
         remote,
         local,
+        &RelPath::default(),
         opts,
         lanes,
         per_lane,
@@ -741,6 +744,7 @@ pub async fn pull_tree(
         Direction::Pull,
         remote,
         local,
+        &dst.clone(),
         opts,
         lanes,
         per_lane,
@@ -1384,6 +1388,8 @@ async fn run<P, Fut>(
     dir: Direction,
     remote: &Remote,
     local: &LocalRoot,
+    // Where a pull writes: a local root of `/` can hold many filesystems.
+    pull_dst: &RelPath,
     opts: &TransferOptions,
     (lanes, max_lanes): (usize, usize),
     per_lane: usize,
@@ -1415,7 +1421,7 @@ where
         Direction::Push => first.available_bytes(remote.root.as_str()).await?,
         Direction::Pull => Some(
             local
-                .available_bytes()
+                .available_bytes(pull_dst)
                 .map_err(local_err(&local.path().display().to_string()))?,
         ),
     };
@@ -1543,7 +1549,8 @@ where
             .try_clone()
             .map_err(local_err(&local.path().display().to_string()))?;
         let path = local.path().display().to_string();
-        blocking(move || root.sync_fs())
+        let synced = pull_dst.clone();
+        blocking(move || root.sync_fs(&synced))
             .await
             .map_err(local_err(&path))?;
     }

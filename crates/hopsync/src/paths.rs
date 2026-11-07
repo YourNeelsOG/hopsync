@@ -11,7 +11,7 @@
 use std::fmt;
 
 mod local;
-pub use local::{DirEntry, EntryKind, LocalRoot, OpenMode};
+pub use local::{DirEntry, EntryKind, Hidden, LocalRoot, OpenMode};
 
 /// Linux NAME_MAX. Longer names cannot be created locally on common filesystems.
 pub const NAME_MAX_BYTES: usize = 255;

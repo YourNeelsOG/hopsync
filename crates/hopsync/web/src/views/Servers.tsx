@@ -12,8 +12,10 @@ import { toast } from "../lib/util";
 
 type Flow =
   | { kind: "form"; server: Server | null }
-  | { kind: "trust"; server: Server; thenInstall: boolean }
-  | { kind: "install"; server: Server }
+  // `password` lives here only until the one login it is for.
+  | { kind: "trust"; server: Server; thenInstall: boolean; password?: string }
+  | { kind: "connecting"; server: Server }
+  | { kind: "install"; server: Server; error?: string }
   | { kind: "remove"; server: Server };
 
 function useReloadServers() {
@@ -26,11 +28,11 @@ const str = (f: FormData, k: string) => {
   return typeof v === "string" ? v.trim() : "";
 };
 
-function ServerForm({ server, onClose, onAdded }: { server: Server | null; onClose: () => void; onAdded: (s: Server, generated: boolean) => void }) {
+function ServerForm({ server, onClose, onAdded }: { server: Server | null; onClose: () => void; onAdded: (s: Server, generated: boolean, password?: string) => void }) {
   const reload = useReloadServers();
   const editing = server !== null;
   const hasGeneratedKey = server?.key_secret != null;
-  const [auth, setAuth] = useState<"generate" | "file">(editing ? "file" : "generate");
+  const [auth, setAuth] = useState<"password" | "generate" | "file">(editing ? "file" : "password");
   const [error, setError] = useState("");
 
   const submit = async (ev: FormEvent<HTMLFormElement>) => {
@@ -50,13 +52,15 @@ function ServerForm({ server, onClose, onAdded }: { server: Server | null; onClo
       root: str(f, "root"),
       min_free: minFree,
     };
-    const generate = !editing && auth === "generate";
+    // A password also gets a generated key: it logs in once to install it, and is never stored.
+    const generate = !editing && auth !== "file";
+    const password = !editing && auth === "password" ? String(f.get("ssh_password") ?? "") : undefined;
     if (!generate && !hasGeneratedKey) spec.key_file = str(f, "key_file");
     try {
       const saved = editing ? await api<Server>("PUT", `/api/servers/${server.id}`, spec) : await api<Server>("POST", "/api/servers", { ...spec, generate_key: generate });
       await reload();
       onClose();
-      if (!editing) onAdded(saved, generate);
+      if (!editing) onAdded(saved, generate, password);
     } catch (e) {
       setError(message(e));
     }
@@ -91,10 +95,22 @@ function ServerForm({ server, onClose, onAdded }: { server: Server | null; onClo
           <fieldset className="my-2.5 rounded-md border border-line p-3">
             <legend className="px-1 text-xs font-medium">Authentication</legend>
             {!editing && (
-              <label className="my-1 flex items-start gap-2">
-                <input type="radio" name="auth" className="mt-0.5" checked={auth === "generate"} onChange={() => setAuth("generate")} />
-                Generate a key for this server (recommended). It is stored encrypted and installed with your password once.
-              </label>
+              <>
+                <label className="my-1 flex items-center gap-2">
+                  <input type="radio" name="auth" checked={auth === "password"} onChange={() => setAuth("password")} />
+                  Password
+                </label>
+                {auth === "password" && (
+                  <>
+                    <input className="input mt-1" type="password" name="ssh_password" aria-label="SSH password" autoComplete="off" required />
+                    <p className="mt-1 mb-2 text-xs text-muted">Used once to log in and set up a private key for this server. Your password is never stored.</p>
+                  </>
+                )}
+                <label className="my-1 flex items-center gap-2">
+                  <input type="radio" name="auth" checked={auth === "generate"} onChange={() => setAuth("generate")} />
+                  Generate a key, and add it to the server myself
+                </label>
+              </>
             )}
             <label className="my-1 flex items-center gap-2">
               <input type="radio" name="auth" checked={auth === "file"} onChange={() => setAuth("file")} />
@@ -106,7 +122,7 @@ function ServerForm({ server, onClose, onAdded }: { server: Server | null; onClo
               aria-label="Key file"
               placeholder="/home/you/.ssh/id_ed25519"
               spellCheck={false}
-              disabled={auth === "generate"}
+              disabled={auth !== "file"}
               required={auth === "file"}
               defaultValue={server?.key_file ?? ""}
             />
@@ -229,7 +245,7 @@ function TrustDialog({ server, thenInstall, onClose, onInstall }: { server: Serv
   );
 }
 
-function InstallDialog({ server, onClose }: { server: Server; onClose: () => void }) {
+function InstallDialog({ server, firstError, onClose }: { server: Server; firstError?: string; onClose: () => void }) {
   const pub = useQuery({
     queryKey: ["public-key", server.id],
     queryFn: () => api<{ public_key: string | null }>("GET", `/api/servers/${server.id}/public-key`),
@@ -237,7 +253,7 @@ function InstallDialog({ server, onClose }: { server: Server; onClose: () => voi
   const [password, setPassword] = useState("");
   const [keyFile, setKeyFile] = useState("");
   const [target, setTarget] = useState("");
-  const [error, setError] = useState("");
+  const [error, setError] = useState(firstError ?? "");
   const [busy, setBusy] = useState(false);
 
   const submit = async (ev: FormEvent) => {
@@ -332,6 +348,22 @@ export function ServersPage() {
   const [flow, setFlow] = useState<Flow | null>(null);
   const close = () => setFlow(null);
 
+  // Once the host key is trusted, so the password only ever goes to the pinned server.
+  const connect = async (server: Server, password?: string) => {
+    if (!password) {
+      setFlow({ kind: "install", server });
+      return;
+    }
+    setFlow({ kind: "connecting", server });
+    try {
+      await api("POST", `/api/servers/${server.id}/install-key`, { password });
+      toast(`${server.name}: connected.`, "ok");
+      setFlow(null);
+    } catch (e) {
+      setFlow({ kind: "install", server, error: message(e) });
+    }
+  };
+
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-3">
       <div className="flex items-center justify-between">
@@ -390,9 +422,16 @@ export function ServersPage() {
           ))}
         </ul>
       )}
-      {flow?.kind === "form" && <ServerForm server={flow.server} onClose={close} onAdded={(server, generated) => setFlow({ kind: "trust", server, thenInstall: generated })} />}
-      {flow?.kind === "trust" && <TrustDialog key={flow.server.id} server={flow.server} thenInstall={flow.thenInstall} onClose={close} onInstall={(server) => setFlow({ kind: "install", server })} />}
-      {flow?.kind === "install" && <InstallDialog server={flow.server} onClose={close} />}
+      {flow?.kind === "form" && <ServerForm server={flow.server} onClose={close} onAdded={(server, generated, password) => setFlow({ kind: "trust", server, thenInstall: generated, password })} />}
+      {flow?.kind === "trust" && <TrustDialog key={flow.server.id} server={flow.server} thenInstall={flow.thenInstall} onClose={close} onInstall={(server) => void connect(server, flow.password)} />}
+      {flow?.kind === "connecting" && (
+        <Dialog title={`Connecting to ${flow.server.name}`} onClose={close}>
+          <p aria-busy="true" className="text-muted">
+            Logging in and setting up a private key…
+          </p>
+        </Dialog>
+      )}
+      {flow?.kind === "install" && <InstallDialog key={flow.error ?? ""} server={flow.server} firstError={flow.error} onClose={close} />}
       {flow?.kind === "remove" && <RemoveDialog server={flow.server} onClose={close} />}
     </div>
   );

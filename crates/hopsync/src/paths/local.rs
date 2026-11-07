@@ -56,21 +56,70 @@ pub struct DirEntry {
     pub kind: EntryKind,
 }
 
+/// What a root keeps out of reach at its top level, however a path is asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Hidden {
+    #[default]
+    Nothing,
+    /// Every hidden entry, for a home folder: `.ssh`, `.bashrc` and `.config` would let a web UI
+    /// login run commands, and Hopsync's own settings and secrets live below `.local`.
+    DotEntries,
+    /// `/proc`, `/sys`, `/dev` and `/run`, for a root of `/`: walking them hangs or reads devices.
+    KernelFilesystems,
+}
+
+impl Hidden {
+    /// What full access over `root` hides.
+    pub fn for_full_access(root: &Path) -> Self {
+        if root == Path::new("/") {
+            Self::KernelFilesystems
+        } else {
+            Self::DotEntries
+        }
+    }
+
+    fn covers(self, top: &str) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::DotEntries => top.starts_with('.'),
+            Self::KernelFilesystems => matches!(top, "proc" | "sys" | "dev" | "run"),
+        }
+    }
+}
+
 pub struct LocalRoot {
     dir: OwnedFd,
     path: PathBuf,
     use_openat2: bool,
+    hidden: Hidden,
 }
 
 impl LocalRoot {
     /// Opens the root chosen by the user. Symlinks in this path itself are followed: the user picked it.
     pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_hiding(path, Hidden::Nothing)
+    }
+
+    /// Like `open`, with `hidden` entries unlisted and refused.
+    pub fn open_hiding(path: &Path, hidden: Hidden) -> io::Result<Self> {
         let dir = rustix::fs::open(path, dir_flags(), Mode::empty())?;
         Ok(Self {
             dir,
             path: path.to_owned(),
             use_openat2: true,
+            hidden,
         })
+    }
+
+    /// Refuses a path whose first component is hidden. Every path-taking method passes through here.
+    fn reachable(&self, rel: &RelPath) -> io::Result<()> {
+        match rel.components().first() {
+            Some(top) if self.hidden.covers(top.as_str()) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "hidden by full access",
+            )),
+            _ => Ok(()),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -99,6 +148,7 @@ impl LocalRoot {
 
     /// Creates every directory of `rel` that does not exist yet. Existing symlinks are never followed.
     pub fn create_dir_all(&self, rel: &RelPath) -> io::Result<()> {
+        self.reachable(rel)?;
         // Single-component steps with O_NOFOLLOW are safe without openat2: a component cannot be
         // `..`, so the only way out is a symlink, and an existing symlink fails the O_DIRECTORY open.
         let mut cur: Option<OwnedFd> = None;
@@ -168,18 +218,31 @@ impl LocalRoot {
         File::from(self.open_parent(rel, flags)?).sync_all()
     }
 
-    /// Flushes the whole filesystem holding the root (`syncfs`): one call instead of an fsync per
-    /// file and directory at the end of a pull.
-    pub fn sync_fs(&self) -> io::Result<()> {
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-        let fd = rustix::fs::openat(&self.dir, ".", flags, Mode::empty())?;
-        Ok(rustix::fs::syncfs(&fd)?)
+    /// Flushes the whole filesystem holding `rel` (`syncfs`): one call instead of an fsync per file
+    /// and directory at the end of a pull. A root of `/` can hold many filesystems.
+    pub fn sync_fs(&self, rel: &RelPath) -> io::Result<()> {
+        Ok(rustix::fs::syncfs(self.nearest_dir(rel)?)?)
     }
 
-    /// Bytes available to this user on the filesystem holding the root.
-    pub fn available_bytes(&self) -> io::Result<u64> {
-        let st = rustix::fs::fstatvfs(&self.dir)?;
+    /// Bytes available to this user on the filesystem that holds, or will hold, `rel`.
+    pub fn available_bytes(&self, rel: &RelPath) -> io::Result<u64> {
+        let st = rustix::fs::fstatvfs(self.nearest_dir(rel)?)?;
         Ok(st.f_bavail.saturating_mul(st.f_frsize))
+    }
+
+    /// `rel`, or its closest parent that exists: a destination is often not created yet. Opened for
+    /// reading, because the root's own handle is `O_PATH` and `syncfs` refuses that.
+    fn nearest_dir(&self, rel: &RelPath) -> io::Result<OwnedFd> {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+        let parts = rel.components();
+        let found = (1..=parts.len()).rev().find_map(|n| {
+            self.open_beneath(&RelPath(parts[..n].to_vec()), flags, Mode::empty())
+                .ok()
+        });
+        match found {
+            Some(fd) => Ok(fd),
+            None => Ok(rustix::fs::openat(&self.dir, ".", flags, Mode::empty())?),
+        }
     }
 
     /// A second handle on the same root (the directory fd is duplicated), for use from other tasks.
@@ -188,6 +251,7 @@ impl LocalRoot {
             dir: self.dir.try_clone()?,
             path: self.path.clone(),
             use_openat2: self.use_openat2,
+            hidden: self.hidden,
         })
     }
 
@@ -205,6 +269,11 @@ impl LocalRoot {
             let entry = entry?;
             let name = entry.file_name().to_bytes();
             if name == b"." || name == b".." {
+                continue;
+            }
+            if rel.components().is_empty()
+                && std::str::from_utf8(name).is_ok_and(|n| self.hidden.covers(n))
+            {
                 continue;
             }
             let ty = match entry.file_type() {
@@ -247,8 +316,24 @@ impl LocalRoot {
         }
     }
 
+    /// Removes the file `rel`. A missing file is not an error.
+    pub fn remove_file(&self, rel: &RelPath) -> io::Result<()> {
+        let Some(name) = rel.components().last() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot remove the root",
+            ));
+        };
+        let parent = self.open_parent(rel, dir_flags())?;
+        match rustix::fs::unlinkat(&parent, name.as_str(), AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Opens the directory containing `rel` (the root for a single component).
     fn open_parent(&self, rel: &RelPath, oflags: OFlags) -> io::Result<OwnedFd> {
+        self.reachable(rel)?;
         let parents = rel.components().split_last().map_or(&[][..], |(_, p)| p);
         let oflags = oflags | OFlags::DIRECTORY | OFlags::NOFOLLOW;
         if parents.is_empty() {
@@ -259,6 +344,7 @@ impl LocalRoot {
 
     /// Opens `rel` beneath the root, refusing symlinks anywhere on the way.
     fn open_beneath(&self, rel: &RelPath, oflags: OFlags, mode: Mode) -> io::Result<OwnedFd> {
+        self.reachable(rel)?;
         if self.use_openat2 {
             let resolve =
                 ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
@@ -543,5 +629,94 @@ mod tests {
         drop(root);
         assert!(copy.create_dir(&rel("x")).expect("create"));
         assert!(dir.path().join("x").is_dir());
+    }
+
+    fn hiding(hidden: Hidden) -> (tempfile::TempDir, LocalRoot) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".ssh")).unwrap();
+        std::fs::write(dir.path().join(".ssh/authorized_keys"), b"key").unwrap();
+        std::fs::write(dir.path().join(".bashrc"), b"rc").unwrap();
+        std::fs::create_dir(dir.path().join("media")).unwrap();
+        std::fs::write(dir.path().join("media/.keep"), b"k").unwrap();
+        std::fs::create_dir(dir.path().join("proc")).unwrap();
+        let root = LocalRoot::open_hiding(dir.path(), hidden).unwrap();
+        (dir, root)
+    }
+
+    fn names(root: &LocalRoot, rel: &RelPath) -> Vec<String> {
+        let mut n: Vec<String> = root
+            .read_dir(rel)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name.to_string_lossy().into_owned())
+            .collect();
+        n.sort();
+        n
+    }
+
+    #[test]
+    fn a_hidden_entry_is_unlisted_and_refused_for_every_operation() {
+        let (dir, root) = hiding(Hidden::DotEntries);
+        assert_eq!(names(&root, &RelPath::default()), ["media", "proc"]);
+        let denied = |r: io::Result<()>| {
+            assert_eq!(r.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        };
+        let keys = RelPath::parse(".ssh/authorized_keys").unwrap();
+        let rc = RelPath::parse(".bashrc").unwrap();
+        let elsewhere = RelPath::parse("media/x").unwrap();
+        denied(root.open_file(&keys, OpenMode::Read).map(drop));
+        denied(root.open_file(&keys, OpenMode::WriteCreate).map(drop));
+        denied(root.open_file(&rc, OpenMode::WriteCreate).map(drop));
+        denied(root.metadata(&keys).map(drop));
+        denied(root.read_dir(&RelPath::parse(".ssh").unwrap()).map(drop));
+        denied(
+            root.create_dir(&RelPath::parse(".config").unwrap())
+                .map(drop),
+        );
+        denied(root.create_dir_all(&RelPath::parse(".config/systemd").unwrap()));
+        denied(root.rename(&elsewhere, &rc, true));
+        denied(root.rename(&rc, &elsewhere, true));
+        denied(
+            root.try_clone()
+                .unwrap()
+                .open_file(&keys, OpenMode::Read)
+                .map(drop),
+        );
+        assert_eq!(std::fs::read(dir.path().join(".bashrc")).unwrap(), b"rc");
+    }
+
+    #[test]
+    fn only_the_top_level_is_hidden() {
+        let (_dir, root) = hiding(Hidden::DotEntries);
+        let media = RelPath::parse("media").unwrap();
+        assert_eq!(names(&root, &media), [".keep"]);
+        root.open_file(&RelPath::parse("media/.keep").unwrap(), OpenMode::Read)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_root_of_slash_hides_kernel_filesystems_only() {
+        let (_dir, root) = hiding(Hidden::KernelFilesystems);
+        assert_eq!(
+            names(&root, &RelPath::default()),
+            [".bashrc", ".ssh", "media"]
+        );
+        assert!(root.read_dir(&RelPath::parse("proc").unwrap()).is_err());
+        assert_eq!(
+            Hidden::for_full_access(Path::new("/")),
+            Hidden::KernelFilesystems
+        );
+        assert_eq!(
+            Hidden::for_full_access(Path::new("/home/a")),
+            Hidden::DotEntries
+        );
+    }
+
+    #[test]
+    fn free_space_is_read_where_the_destination_will_be() {
+        let (_dir, root) = hiding(Hidden::Nothing);
+        let absent = RelPath::parse("media/not/yet").unwrap();
+        assert!(root.available_bytes(&absent).unwrap() > 0);
+        root.sync_fs(&absent).unwrap();
     }
 }
