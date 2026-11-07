@@ -38,6 +38,7 @@ async fn daemon() -> Daemon {
     let svc = Service::open(ServiceConfig {
         data_dir: data.path().join("data"),
         local_root: local.path().to_owned(),
+        hidden: Default::default(),
         concurrency: 2,
         ssh: SshOptions::default(),
     })
@@ -598,6 +599,7 @@ async fn shutdown_does_not_wait_for_open_event_streams() {
     let svc = Service::open(ServiceConfig {
         data_dir: data.path().join("data"),
         local_root: data.path().to_owned(),
+        hidden: Default::default(),
         concurrency: 1,
         ssh: SshOptions::default(),
     })
@@ -794,4 +796,262 @@ async fn an_idle_event_stream_ends_when_its_session_does() {
     })
     .await;
     assert!(ended.is_ok(), "the stream must end within a heartbeat");
+}
+
+/// Requests with a body the JSON client cannot send: an upload as a browser sends it.
+fn put_file(
+    d: &Daemon,
+    cookie: &str,
+    path: &str,
+    content_type: &str,
+    origin: &str,
+    body: &str,
+) -> String {
+    format!(
+        "PUT /api/local/file?{path} HTTP/1.1\r\nHost: {a}\r\nOrigin: {origin}\r\nCookie: {cookie}\r\nContent-Type: {content_type}\r\nContent-Length: {n}\r\nConnection: close\r\n\r\n{body}",
+        a = d.addr,
+        n = body.len()
+    )
+}
+
+fn get_file(d: &Daemon, cookie: &str, path: &str) -> String {
+    format!(
+        "GET /api/local/file?path={path} HTTP/1.1\r\nHost: {a}\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n",
+        a = d.addr
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_browser_can_upload_a_file_and_save_it_back() {
+    let d = daemon().await;
+    let c = logged_in(&d).await;
+    let cookie = c.cookie.clone().expect("cookie");
+    let origin = format!("http://{}", d.addr);
+    let bin = "application/octet-stream";
+    std::fs::create_dir(d.local.path().join("in")).expect("mkdir");
+
+    let (status, text) = raw(
+        d.addr,
+        &put_file(&d, &cookie, "path=in/a%20b.txt", bin, &origin, "hello"),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(
+        std::fs::read(d.local.path().join("in/a b.txt")).expect("written"),
+        b"hello"
+    );
+    let names: Vec<_> = std::fs::read_dir(d.local.path().join("in"))
+        .expect("list")
+        .collect();
+    assert_eq!(names.len(), 1, "no part file stays behind");
+
+    // An existing file needs a clear yes.
+    let (status, _) = raw(
+        d.addr,
+        &put_file(&d, &cookie, "path=in/a%20b.txt", bin, &origin, "other"),
+    )
+    .await;
+    assert_eq!(status, 409);
+    assert_eq!(
+        std::fs::read(d.local.path().join("in/a b.txt")).expect("kept"),
+        b"hello"
+    );
+    let (status, _) = raw(
+        d.addr,
+        &put_file(
+            &d,
+            &cookie,
+            "path=in/a%20b.txt&overwrite=true",
+            bin,
+            &origin,
+            "other",
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        std::fs::read(d.local.path().join("in/a b.txt")).expect("replaced"),
+        b"other"
+    );
+
+    let (status, text) = raw(d.addr, &get_file(&d, &cookie, "in/a%20b.txt")).await;
+    assert_eq!(status, 200, "{text}");
+    let lower = text.to_lowercase();
+    assert!(
+        lower.contains("content-type: application/octet-stream"),
+        "{text}"
+    );
+    assert!(
+        lower.contains("content-disposition: attachment; filename*=utf-8''a%20b.txt"),
+        "{text}"
+    );
+    assert!(lower.contains("x-content-type-options: nosniff"), "{text}");
+    assert!(text.ends_with("other"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_routes_keep_the_guards_of_every_other_route() {
+    let d = daemon().await;
+    let c = logged_in(&d).await;
+    let cookie = c.cookie.clone().expect("cookie");
+    let origin = format!("http://{}", d.addr);
+    let bin = "application/octet-stream";
+    std::fs::write(d.local.path().join("secret"), b"x").expect("write");
+
+    // No session.
+    assert_eq!(raw(d.addr, &get_file(&d, "none=1", "secret")).await.0, 401);
+    assert_eq!(
+        raw(
+            d.addr,
+            &put_file(&d, "none=1", "path=new", bin, &origin, "x")
+        )
+        .await
+        .0,
+        401
+    );
+    // Another site, and the body types an HTML form can send without a preflight.
+    assert_eq!(
+        raw(
+            d.addr,
+            &put_file(&d, &cookie, "path=new", bin, "https://evil.example", "x")
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        raw(
+            d.addr,
+            &put_file(&d, &cookie, "path=new", "text/plain", &origin, "x")
+        )
+        .await
+        .0,
+        415
+    );
+    assert_eq!(
+        raw(
+            d.addr,
+            &put_file(&d, &cookie, "path=new", "multipart/form-data", &origin, "x")
+        )
+        .await
+        .0,
+        415
+    );
+    // Only this route takes a raw body.
+    let other = format!(
+        "POST /api/jobs HTTP/1.1\r\nHost: {a}\r\nOrigin: {origin}\r\nCookie: {cookie}\r\nContent-Type: {bin}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        a = d.addr
+    );
+    assert_eq!(raw(d.addr, &other).await.0, 415);
+    assert!(!d.local.path().join("new").exists());
+
+    // Out of the root, and things that are not files.
+    assert_eq!(
+        raw(d.addr, &get_file(&d, &cookie, "..%2Fetc%2Fpasswd"))
+            .await
+            .0,
+        400
+    );
+    assert_eq!(
+        raw(
+            d.addr,
+            &put_file(&d, &cookie, "path=..%2Fescape", bin, &origin, "x")
+        )
+        .await
+        .0,
+        400
+    );
+    assert_eq!(
+        raw(d.addr, &put_file(&d, &cookie, "path=", bin, &origin, "x"))
+            .await
+            .0,
+        400
+    );
+    assert_eq!(raw(d.addr, &get_file(&d, &cookie, "missing")).await.0, 404);
+    std::fs::create_dir(d.local.path().join("dir")).expect("mkdir");
+    assert_eq!(raw(d.addr, &get_file(&d, &cookie, "dir")).await.0, 400);
+    assert_eq!(
+        raw(
+            d.addr,
+            &put_file(&d, &cookie, "path=dir&overwrite=true", bin, &origin, "x")
+        )
+        .await
+        .0,
+        409
+    );
+    assert_eq!(
+        raw(
+            d.addr,
+            &put_file(&d, &cookie, "path=no%2Fsuch%2Ffile", bin, &origin, "x")
+        )
+        .await
+        .0,
+        404
+    );
+    std::os::unix::fs::symlink("/etc/passwd", d.local.path().join("link")).expect("symlink");
+    assert_eq!(raw(d.addr, &get_file(&d, &cookie, "link")).await.0, 400);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_upload_leaves_nothing_behind() {
+    let d = daemon().await;
+    let c = logged_in(&d).await;
+    let cookie = c.cookie.clone().expect("cookie");
+    let origin = format!("http://{}", d.addr);
+    let mut s = tokio::net::TcpStream::connect(d.addr)
+        .await
+        .expect("connect");
+    let head = format!(
+        "PUT /api/local/file?path=cut.bin HTTP/1.1\r\nHost: {a}\r\nOrigin: {origin}\r\nCookie: {cookie}\r\nContent-Type: application/octet-stream\r\nContent-Length: 1000000\r\n\r\npartial",
+        a = d.addr
+    );
+    s.write_all(head.as_bytes()).await.expect("write");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(s);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let left: Vec<_> = std::fs::read_dir(d.local.path()).expect("list").collect();
+        if left.is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "left behind: {left:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!d.local.path().join("cut.bin").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_file_route_keeps_the_same_guards() {
+    let d = daemon().await;
+    let c = logged_in(&d).await;
+    let cookie = c.cookie.clone().expect("cookie");
+    let origin = format!("http://{}", d.addr);
+    let put = |cookie: &str, ctype: &str, origin: &str| {
+        format!(
+            "PUT /api/servers/1/file?path=x HTTP/1.1\r\nHost: {a}\r\nOrigin: {origin}\r\nCookie: {cookie}\r\nContent-Type: {ctype}\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+            a = d.addr
+        )
+    };
+    let bin = "application/octet-stream";
+    assert_eq!(raw(d.addr, &put("none=1", bin, &origin)).await.0, 401);
+    assert_eq!(
+        raw(d.addr, &put(&cookie, bin, "https://evil.example"))
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        raw(d.addr, &put(&cookie, "text/plain", &origin)).await.0,
+        415
+    );
+    // Passes the guards; there is simply no such server.
+    assert_eq!(raw(d.addr, &put(&cookie, bin, &origin)).await.0, 404);
+    let get = format!(
+        "GET /api/servers/1/file?path=x HTTP/1.1\r\nHost: {a}\r\nConnection: close\r\n\r\n",
+        a = d.addr
+    );
+    assert_eq!(raw(d.addr, &get).await.0, 401);
 }

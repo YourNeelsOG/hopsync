@@ -14,6 +14,7 @@ pub mod plan;
 pub mod policy;
 pub mod pool;
 pub mod service;
+pub mod settings;
 pub mod setup;
 pub mod sftp;
 pub mod ssh;

@@ -27,10 +27,13 @@ use zeroize::Zeroizing;
 
 use crate::auth::check_password_rules;
 use crate::client::{Client, Endpoint};
+use crate::settings::Settings;
 use crate::ui::Ui;
 
 const SYSTEM_TEMPLATE: &str = include_str!("../../../contrib/systemd/hopsync.service");
 const USER_TEMPLATE: &str = include_str!("../../../contrib/systemd/user/hopsync.service");
+const FULL_TEMPLATE: &str = include_str!("../../../contrib/systemd/hopsync-full.service");
+const SYSTEM_SETTINGS: &str = "/etc/hopsync/config.toml";
 const MARKER: &str =
     "# Managed by hopsync setup. The next setup replaces edits; `hopsync uninstall` removes it.";
 const SYSTEM_UNIT: &str = "/etc/systemd/system/hopsync.service";
@@ -115,7 +118,8 @@ pub fn check_folder_text(folder: &str) -> Fallible<PathBuf> {
     if FORBIDDEN.iter().any(|f| clean == Path::new(f)) {
         return Err(format!(
             "{folder} is a system folder, and Hopsync could read and write everything under it. \
-             Choose a folder for transfers."
+             Choose a folder for transfers. To open the whole box to the web UI instead, run \
+             `hopsync setup --full-access`."
         ));
     }
     Ok(clean)
@@ -168,7 +172,9 @@ pub fn service_owner(folder: &Path, owner: Option<&str>) -> Fallible<String> {
 
 #[derive(Debug, Clone)]
 pub struct UnitSpec {
+    /// The root the daemon gets: the chosen folder, or the home folder with full access.
     pub folder: PathBuf,
+    pub full_access: bool,
     pub port: u16,
     pub public: Option<Public>,
     /// System only: the account and its primary group.
@@ -315,6 +321,23 @@ pub fn render_system_unit(s: &UnitSpec) -> Fallible<String> {
     Ok(format!("{MARKER}\n{u}"))
 }
 
+/// The system unit for full access: root, over the whole box.
+pub fn render_full_system_unit(s: &UnitSpec) -> Fallible<String> {
+    let u = swap(
+        body(FULL_TEMPLATE),
+        "--listen 127.0.0.1:7890",
+        &listen_args(s.port, s.public.as_ref())?.join(" "),
+    )?;
+    Ok(format!("{MARKER}\n{u}"))
+}
+
+/// Whether a unit gives the daemon full access.
+pub fn unit_has_full_access(unit: &str) -> bool {
+    unit.lines()
+        .find_map(|l| l.strip_prefix("ExecStart="))
+        .is_some_and(|e| e.split_whitespace().any(|w| w == "--full-access"))
+}
+
 /// The user unit, with the binary and data directory named outright: a user manager's environment
 /// can differ from the login shell's, and the daemon must use the data directory setup reads from.
 pub fn render_user_unit(s: &UnitSpec) -> Fallible<String> {
@@ -330,8 +353,9 @@ pub fn render_user_unit(s: &UnitSpec) -> Fallible<String> {
         body(USER_TEMPLATE),
         "%h/.local/bin/hopsync serve --listen 127.0.0.1:7890",
         &format!(
-            "{exec} serve {} --data-dir {data} --root {folder}",
-            listen_args(s.port, s.public.as_ref())?.join(" ")
+            "{exec} serve {} --data-dir {data} --root {folder}{}",
+            listen_args(s.port, s.public.as_ref())?.join(" "),
+            if s.full_access { " --full-access" } else { "" }
         ),
     )?;
     Ok(format!("{MARKER}\n{u}"))
@@ -694,6 +718,8 @@ fn stdin_line() -> Fallible<Zeroizing<String>> {
 #[derive(Debug, Clone, Default)]
 pub struct SetupOptions {
     pub folder: Option<String>,
+    /// `--full-access` or `--folder-only`; from the settings file or asked on a terminal when `None`.
+    pub full_access: Option<bool>,
     pub port: Option<u16>,
     /// `--public` or `--local-only`; asked for on a terminal when `None`.
     pub public: Option<bool>,
@@ -710,6 +736,7 @@ struct Started {
     uid: u32,
     data_dir: PathBuf,
     folder: PathBuf,
+    full_access: bool,
     setup_required: bool,
 }
 
@@ -814,7 +841,20 @@ fn summary(ui: &Ui, mode: Mode, s: &Started) {
             ),
         ],
     };
-    rows.extend([("Files folder".to_owned(), s.folder.display().to_string())]);
+    if s.full_access {
+        let reach = match mode {
+            Mode::System => "the whole box, as root".to_owned(),
+            _ => format!("{}, except hidden items", s.folder.display()),
+        };
+        rows.push(("Web UI reaches".to_owned(), reach));
+    } else {
+        rows.push(("Files folder".to_owned(), s.folder.display().to_string()));
+    }
+    if let Ok(path) = settings_path(mode) {
+        rows.push(("Settings file".to_owned(), path.display().to_string()));
+        // `systemctl restart` alone keeps the old unit, which decides the account and the access.
+        rows.push(("Apply a change".to_owned(), "hopsync restart".to_owned()));
+    }
     rows.extend(
         command_rows(mode)
             .into_iter()
@@ -831,6 +871,100 @@ fn summary(ui: &Ui, mode: Mode, s: &Started) {
         Mode::Background => "Hopsync is running in the background",
     };
     ui.panel(title, &rows);
+    if s.full_access {
+        ui.warn(
+            "Full access is on: anyone with the web UI password controls what is listed above.",
+        );
+    }
+}
+
+/// Where the settings file lives in `mode`.
+fn settings_path(mode: Mode) -> Fallible<PathBuf> {
+    Ok(match mode {
+        Mode::System => PathBuf::from(SYSTEM_SETTINGS),
+        Mode::User | Mode::Background => home()?.join(".config/hopsync/config.toml"),
+    })
+}
+
+/// The settings file, if there is one. A file with a mistake in it is an error, so nothing changes.
+fn read_settings(mode: Mode) -> Fallible<Option<Settings>> {
+    let path = settings_path(mode)?;
+    match std::fs::read_to_string(&path) {
+        Ok(text) => crate::settings::parse(&text)
+            .map(Some)
+            .map_err(|e| format!("{}: {e}. Nothing was changed.", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Writes the settings file unless it already says this, which keeps a person's own comments.
+fn save_settings(mode: Mode, wanted: &Settings) -> Fallible<()> {
+    if read_settings(mode)?.as_ref() == Some(wanted) {
+        return Ok(());
+    }
+    let path = settings_path(mode)?;
+    let dir = path.parent().ok_or("the settings file has no folder")?;
+    if mode == Mode::System {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    } else {
+        private_dir(dir)?;
+    }
+    write_atomic(&path, crate::settings::render(wanted).as_bytes(), 0o600)
+}
+
+/// Whether the web UI gets full access: as asked by a flag, as saved, as answered on a first setup
+/// on a terminal, or not. An upgrade or a script that says nothing never gains it.
+fn pick_full_access(
+    ui: &Ui,
+    o: &SetupOptions,
+    mode: Mode,
+    saved: Option<bool>,
+    installed: bool,
+) -> Fallible<bool> {
+    if let Some(wanted) = o.full_access.or(saved) {
+        return Ok(wanted);
+    }
+    if installed || !std::io::stdin().is_terminal() || o.password_stdin {
+        return Ok(false);
+    }
+    ui.warn(match mode {
+        Mode::System => {
+            "The web UI can stay in one folder, or reach this whole box as root. With the whole \
+             box, anyone with its password controls this server."
+        }
+        _ => {
+            "The web UI can stay in one folder, or reach your whole home folder except hidden \
+             items like ~/.ssh. With the home folder, anyone with its password gets those files."
+        }
+    });
+    let question = match mode {
+        Mode::System => "Open the whole box to the web UI?",
+        _ => "Open your whole home folder to the web UI?",
+    };
+    ui.confirm(question).map_err(|e| e.to_string())
+}
+
+/// Whether the settings file asks for something the service is not running with.
+fn settings_differ(mode: Mode, wanted: &Settings) -> Fallible<bool> {
+    let (full, folder) = match mode {
+        Mode::Background => {
+            let state = read_state(&user_data_dir()?).ok_or("Hopsync is not set up")?;
+            (state.full_access, state.folder)
+        }
+        _ => {
+            let path = if mode == Mode::System {
+                PathBuf::from(SYSTEM_UNIT)
+            } else {
+                user_unit_path()?
+            };
+            let unit =
+                std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let folder = parse_unit(&unit).map(|p| p.0).unwrap_or_default();
+            (unit_has_full_access(&unit), folder)
+        }
+    };
+    Ok(full != wanted.full_access || (!full && folder != wanted.folder))
 }
 
 /// Whether to open the web UI on this server's address: as asked by a flag, as chosen last time, as
@@ -879,9 +1013,11 @@ fn pick_public(ui: &Ui, o: &SetupOptions, previous: Option<&Public>) -> Fallible
 fn pick_folder(
     ui: &Ui,
     o: &SetupOptions,
+    saved: Option<&Path>,
     previous: Option<&Path>,
     default: &str,
     data_dir: &Path,
+    full_access: bool,
 ) -> Fallible<PathBuf> {
     let home_dir = home().unwrap_or_default();
     let check = |text: &str| -> Fallible<PathBuf> {
@@ -892,10 +1028,15 @@ fn pick_folder(
     if let Some(f) = &o.folder {
         return check(f);
     }
+    // A person may have typed this one, so it is checked like an answer.
+    if let Some(s) = saved {
+        return check(&s.to_string_lossy());
+    }
     if let Some(p) = previous {
         return Ok(p.to_owned());
     }
-    if !std::io::stdin().is_terminal() || o.password_stdin {
+    // With full access this is only remembered for later, so there is nothing to ask.
+    if full_access || !std::io::stdin().is_terminal() || o.password_stdin {
         return check(default);
     }
     loop {
@@ -937,6 +1078,42 @@ fn with_journal(mode: Mode, error: String) -> String {
     }
 }
 
+/// A system service's folder: created if missing. Returns the account, group and uid that run it.
+fn ready_system_folder(ui: &Ui, folder: &Path) -> Fallible<(String, String, u32)> {
+    let owner = match std::fs::metadata(folder) {
+        Ok(m) if !m.is_dir() => return Err(format!("{} is not a folder", folder.display())),
+        Ok(m) => Some(run("id", &["-nu", &m.uid().to_string()]).map_err(|_| {
+            format!(
+                "{} belongs to uid {}, which has no account here",
+                folder.display(),
+                m.uid()
+            )
+        })?),
+        Err(_) => None,
+    };
+    let user = service_owner(folder, owner.as_deref())?;
+    let group = run("id", &["-gn", &user])?;
+    let uid: u32 = run("id", &["-u", &user])?
+        .parse()
+        .map_err(|_| format!("cannot read the uid of {user}"))?;
+
+    if owner.is_none() {
+        ui.step("Creating your files folder", || -> Fallible<()> {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o750)
+                .create(folder)
+                .map_err(|e| format!("{}: {e}", folder.display()))?;
+            run(
+                "chown",
+                &[&format!("{user}:{group}"), "--", &folder.to_string_lossy()],
+            )
+            .map(|_| ())
+        })?;
+    }
+    Ok((user, group, uid))
+}
+
 fn setup_system(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
     let unit = Path::new(SYSTEM_UNIT);
     let previous = std::fs::read_to_string(unit).ok();
@@ -949,12 +1126,27 @@ fn setup_system(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
     }
     let parsed = previous.as_deref().and_then(parse_unit);
     let running = previous.is_some() && service_active(Mode::System);
+    let saved = read_settings(Mode::System)?;
+    let was_full = previous.as_deref().is_some_and(unit_has_full_access);
+    let full_access = pick_full_access(
+        ui,
+        o,
+        Mode::System,
+        saved
+            .as_ref()
+            .map(|s| s.full_access)
+            .or(was_full.then_some(true)),
+        previous.is_some(),
+    )?;
     let folder = pick_folder(
         ui,
         o,
-        parsed.as_ref().map(|p| p.0.as_path()),
+        saved.as_ref().map(|s| s.folder.as_path()),
+        // A full access unit's --root is not a folder anyone chose.
+        parsed.as_ref().filter(|_| !was_full).map(|p| p.0.as_path()),
         SYSTEM_FOLDER,
         Path::new(SYSTEM_DATA),
+        full_access,
     )?;
     let port = choose_port(o.port, parsed.as_ref().map(|p| p.1), running)?;
     let public = pick_public(ui, o, previous.as_deref().and_then(parse_public).as_ref())?;
@@ -982,40 +1174,14 @@ fn setup_system(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
         ui.skipped("Service account ready");
     }
 
-    let owner = match std::fs::metadata(&folder) {
-        Ok(m) if !m.is_dir() => return Err(format!("{} is not a folder", folder.display())),
-        Ok(m) => Some(run("id", &["-nu", &m.uid().to_string()]).map_err(|_| {
-            format!(
-                "{} belongs to uid {}, which has no account here",
-                folder.display(),
-                m.uid()
-            )
-        })?),
-        Err(_) => None,
+    let (user, group, uid) = if full_access {
+        ("root".to_owned(), "root".to_owned(), 0)
+    } else {
+        ready_system_folder(ui, &folder)?
     };
-    let user = service_owner(&folder, owner.as_deref())?;
-    let group = run("id", &["-gn", &user])?;
-    let uid: u32 = run("id", &["-u", &user])?
-        .parse()
-        .map_err(|_| format!("cannot read the uid of {user}"))?;
-
-    if owner.is_none() {
-        ui.step("Creating your files folder", || -> Fallible<()> {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o750)
-                .create(&folder)
-                .map_err(|e| format!("{}: {e}", folder.display()))?;
-            run(
-                "chown",
-                &[&format!("{user}:{group}"), "--", &folder.to_string_lossy()],
-            )
-            .map(|_| ())
-        })?;
-    }
-
     let spec = UnitSpec {
         folder: folder.clone(),
+        full_access,
         port,
         public: public.clone(),
         user,
@@ -1023,10 +1189,21 @@ fn setup_system(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
         exec: PathBuf::from(SYSTEM_BIN),
         data_dir: PathBuf::from(SYSTEM_DATA),
     };
-    let rendered = render_system_unit(&spec)?;
+    let rendered = if full_access {
+        render_full_system_unit(&spec)?
+    } else {
+        render_system_unit(&spec)?
+    };
+    save_settings(
+        Mode::System,
+        &Settings {
+            full_access,
+            folder: folder.clone(),
+        },
+    )?;
     let new_binary = ui.step("Installing the binary", || {
         install_binary(Path::new(SYSTEM_BIN))
-    })?;
+    })? || daemon_is_outdated(service_pid(Mode::System));
     let changed = ui.step("Writing the system service", || -> Fallible<bool> {
         let changed = write_unit(unit, &rendered)?;
         if changed {
@@ -1057,6 +1234,7 @@ fn setup_system(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
         uid,
         data_dir: PathBuf::from(SYSTEM_DATA),
         folder,
+        full_access,
         setup_required,
     })
 }
@@ -1099,18 +1277,39 @@ fn setup_user(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
     let home_dir = home()?;
     let default = home_dir.join("hopsync").to_string_lossy().into_owned();
     let data_dir = user_data_dir()?;
+    let saved = read_settings(Mode::User)?;
+    let was_full = previous.as_deref().is_some_and(unit_has_full_access);
+    let full_access = pick_full_access(
+        ui,
+        o,
+        Mode::User,
+        saved
+            .as_ref()
+            .map(|s| s.full_access)
+            .or(was_full.then_some(true)),
+        previous.is_some(),
+    )?;
     let folder = pick_folder(
         ui,
         o,
-        parsed.as_ref().map(|p| p.0.as_path()),
+        saved.as_ref().map(|s| s.folder.as_path()),
+        parsed.as_ref().filter(|_| !was_full).map(|p| p.0.as_path()),
         &default,
         &data_dir,
+        full_access,
     )?;
+    let chosen = folder.clone();
+    let folder = if full_access {
+        home_dir.clone()
+    } else {
+        folder
+    };
     let port = choose_port(o.port, parsed.as_ref().map(|p| p.1), running)?;
     let public = pick_public(ui, o, previous.as_deref().and_then(parse_public).as_ref())?;
     let exec = own_binary_path(&home_dir)?;
     let spec = UnitSpec {
         folder: folder.clone(),
+        full_access,
         port,
         public: public.clone(),
         user: String::new(),
@@ -1121,7 +1320,15 @@ fn setup_user(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
     let rendered = render_user_unit(&spec)?;
     ready_own_folder(ui, &folder)?;
     private_dir(&data_dir)?;
-    let new_binary = ui.step("Installing the binary", || install_binary(&exec))?;
+    save_settings(
+        Mode::User,
+        &Settings {
+            full_access,
+            folder: chosen,
+        },
+    )?;
+    let new_binary = ui.step("Installing the binary", || install_binary(&exec))?
+        || daemon_is_outdated(service_pid(Mode::User));
     let changed = ui.step("Writing the user service", || -> Fallible<bool> {
         let changed = write_unit(&unit, &rendered)?;
         if changed {
@@ -1157,8 +1364,31 @@ fn setup_user(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
         uid,
         data_dir,
         folder,
+        full_access,
         setup_required,
     })
+}
+
+/// Whether a process's `/proc/<pid>/exe` link says its binary has since been replaced on disk.
+pub fn binary_was_replaced(exe: &Path) -> bool {
+    exe.to_string_lossy().ends_with(" (deleted)")
+}
+
+/// Whether a running daemon is an older binary. The install script replaces the file before setup
+/// runs, so setup finds nothing new to install, and only the running process shows the difference.
+fn daemon_is_outdated(pid: Option<i32>) -> bool {
+    pid.and_then(|p| std::fs::read_link(format!("/proc/{p}/exe")).ok())
+        .is_some_and(|exe| binary_was_replaced(&exe))
+}
+
+/// The main process of a service, from systemd.
+fn service_pid(mode: Mode) -> Option<i32> {
+    systemctl(mode, &["show", "--property=MainPID", "--value", "hopsync"])
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|p| *p > 0)
 }
 
 /// Where a non-root install keeps the binary: where it is if that is a system folder, else ~/.local.
@@ -1180,6 +1410,8 @@ struct BackgroundState {
     port: u16,
     #[serde(default)]
     public: Option<Public>,
+    #[serde(default)]
+    full_access: bool,
 }
 
 fn state_path(data_dir: &Path) -> PathBuf {
@@ -1224,7 +1456,12 @@ fn background_start(data_dir: &Path, state: &BackgroundState) -> Fallible<()> {
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--root")
-        .arg(&state.folder)
+        .arg(if state.full_access {
+            home()?
+        } else {
+            state.folder.clone()
+        })
+        .args(state.full_access.then_some("--full-access"))
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err);
@@ -1316,30 +1553,58 @@ fn setup_background(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
     let running = running_pid(&data_dir).is_some();
     let home_dir = home()?;
     let default = home_dir.join("hopsync").to_string_lossy().into_owned();
+    let saved = read_settings(Mode::Background)?;
+    let full_access = pick_full_access(
+        ui,
+        o,
+        Mode::Background,
+        saved
+            .as_ref()
+            .map(|s| s.full_access)
+            .or(previous.as_ref().filter(|p| p.full_access).map(|_| true)),
+        previous.is_some(),
+    )?;
     let folder = pick_folder(
         ui,
         o,
+        saved.as_ref().map(|s| s.folder.as_path()),
         previous.as_ref().map(|s| s.folder.as_path()),
         &default,
         &data_dir,
+        full_access,
     )?;
+    if full_access {
+        check_path_text(&home_dir.to_string_lossy())?;
+    }
     let port = choose_port(o.port, previous.as_ref().map(|s| s.port), running)?;
     let public = pick_public(ui, o, previous.as_ref().and_then(|s| s.public.as_ref()))?;
     let exec = own_binary_path(&home_dir)?;
-    ready_own_folder(ui, &folder)?;
+    if !full_access {
+        ready_own_folder(ui, &folder)?;
+    }
     private_dir(&data_dir)?;
-    let new_binary = ui.step("Installing the binary", || install_binary(&exec))?;
+    save_settings(
+        Mode::Background,
+        &Settings {
+            full_access,
+            folder: folder.clone(),
+        },
+    )?;
+    let new_binary = ui.step("Installing the binary", || install_binary(&exec))?
+        || daemon_is_outdated(running_pid(&data_dir));
     let state = BackgroundState {
         exec: exec.clone(),
         folder: folder.clone(),
         port,
         public: public.clone(),
+        full_access,
     };
     let changed = previous.as_ref().is_none_or(|p| {
         p.folder != state.folder
             || p.port != state.port
             || p.exec != state.exec
             || p.public != state.public
+            || p.full_access != state.full_access
     });
     if changed {
         let text = serde_json::to_vec(&state).map_err(|e| e.to_string())?;
@@ -1387,7 +1652,8 @@ fn setup_background(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
         port,
         uid,
         data_dir,
-        folder,
+        folder: if full_access { home_dir } else { folder },
+        full_access,
         setup_required,
     })
 }
@@ -1443,6 +1709,14 @@ pub fn control(what: Control) -> Fallible<()> {
 
 fn run_control(what: Control) -> Fallible<()> {
     let mode = installed_mode()?;
+    // Without root a system install's settings cannot be read, and systemctl says why that fails.
+    if matches!(what, Control::Restart)
+        && (mode != Mode::System || is_root())
+        && let Some(wanted) = read_settings(mode)?
+        && settings_differ(mode, &wanted)?
+    {
+        return run_setup(&SetupOptions::default());
+    }
     if mode == Mode::Background {
         return background_control(what);
     }
@@ -1520,19 +1794,29 @@ pub fn run_uninstall(purge: bool, yes: bool, plain: bool) -> Fallible<()> {
         Mode::System => PathBuf::from(SYSTEM_HOME),
         _ => user_data_dir()?,
     };
-    // Read now: the unit and the state file are gone by the time the panel is printed.
-    let folder = match mode {
-        Mode::System => std::fs::read_to_string(SYSTEM_UNIT)
-            .ok()
-            .and_then(|u| parse_unit(&u))
-            .map(|(f, _)| f),
-        Mode::User => user_unit_path()
-            .ok()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|u| parse_unit(&u))
-            .map(|(f, _)| f),
-        Mode::Background => read_state(&data_dir).map(|s| s.folder),
-    };
+    // Read now: the unit and the state file are gone by the time the panel is printed. Full access
+    // has no folder of its own to point to.
+    let folder = read_settings(mode)
+        .ok()
+        .flatten()
+        .filter(|s| !s.full_access)
+        .map(|s| s.folder)
+        .or_else(|| match mode {
+            Mode::System => std::fs::read_to_string(SYSTEM_UNIT)
+                .ok()
+                .filter(|u| !unit_has_full_access(u))
+                .and_then(|u| parse_unit(&u))
+                .map(|(f, _)| f),
+            Mode::User => user_unit_path()
+                .ok()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .filter(|u| !unit_has_full_access(u))
+                .and_then(|u| parse_unit(&u))
+                .map(|(f, _)| f),
+            Mode::Background => read_state(&data_dir)
+                .filter(|s| !s.full_access)
+                .map(|s| s.folder),
+        });
     if !yes {
         let what = if purge {
             format!(
@@ -1604,6 +1888,13 @@ pub fn run_uninstall(purge: bool, yes: bool, plain: bool) -> Fallible<()> {
         ui.step("Deleting saved servers and keys", || {
             std::fs::remove_dir_all(&data_dir).map_err(|e| format!("{}: {e}", data_dir.display()))
         })?;
+        if let Ok(path) = settings_path(mode) {
+            let _ = std::fs::remove_file(&path);
+            // Fails if anything else is in there, which then stays.
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::remove_dir(dir);
+            }
+        }
         if mode == Mode::System {
             let _ = run("userdel", &[SERVICE_USER]);
         }
@@ -1634,6 +1925,7 @@ mod tests {
     fn spec(folder: &str) -> UnitSpec {
         UnitSpec {
             public: None,
+            full_access: false,
             folder: PathBuf::from(folder),
             port: 8123,
             user: "alice".into(),
@@ -1890,6 +2182,72 @@ mod tests {
         let user = render_user_unit(&spec("/home/a/b")).unwrap();
         assert_eq!(parse_unit(&user), Some((PathBuf::from("/home/a/b"), 8123)));
         assert_eq!(parse_unit("[Service]\nExecStart=/bin/true\n"), None);
+    }
+
+    #[test]
+    fn the_full_access_unit_runs_as_root_over_the_whole_box() {
+        let mut s = spec("/srv/x");
+        s.full_access = true;
+        let u = render_full_system_unit(&s).unwrap();
+        assert!(u.starts_with(MARKER));
+        // systemd sets HOME only when User= is named, and the daemon cannot start without it.
+        assert!(u.contains("\nUser=root\n"), "{u}");
+        assert!(u.contains("--listen 127.0.0.1:8123"), "{u}");
+        assert!(u.contains("--root / --full-access"), "{u}");
+        assert!(unit_has_full_access(&u));
+        assert_eq!(parse_unit(&u), Some((PathBuf::from("/"), 8123)));
+        // Root's powers beyond files stay out of reach.
+        assert!(
+            u.contains("CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER\n")
+        );
+        assert!(u.contains("NoNewPrivileges=yes"));
+        assert!(u.contains("UMask=0022"));
+        // SQLite calls fchown on its journal files when it runs as root. Without this the filter
+        // kills the daemon at its first write.
+        let (denied, allowed) = (
+            u.find("SystemCallFilter=~@privileged").unwrap(),
+            u.find("SystemCallFilter=@chown\n").expect("chown allowed"),
+        );
+        assert!(denied < allowed, "a later line must add it back");
+    }
+
+    #[test]
+    fn the_default_units_do_not_have_full_access() {
+        let s = spec("/srv/data");
+        let sys = render_system_unit(&s).unwrap();
+        assert!(sys.contains("User=alice"));
+        assert!(!unit_has_full_access(&sys));
+        assert!(!unit_has_full_access(&render_user_unit(&s).unwrap()));
+        assert!(!unit_has_full_access(
+            "[Service]\nDescription=--full-access\n"
+        ));
+    }
+
+    #[test]
+    fn a_user_unit_with_full_access_says_so() {
+        let mut s = spec("/home/alice");
+        s.full_access = true;
+        let u = render_user_unit(&s).unwrap();
+        assert!(u.contains("--root /home/alice --full-access"), "{u}");
+        assert!(unit_has_full_access(&u));
+    }
+
+    #[test]
+    fn a_refused_system_folder_names_the_way_to_full_access() {
+        assert!(
+            check_folder_text("/root")
+                .unwrap_err()
+                .contains("--full-access")
+        );
+    }
+
+    #[test]
+    fn a_daemon_whose_binary_was_replaced_is_out_of_date() {
+        let current = Path::new("/usr/local/bin/hopsync");
+        assert!(!binary_was_replaced(current));
+        assert!(binary_was_replaced(Path::new(
+            "/usr/local/bin/hopsync (deleted)"
+        )));
     }
 
     #[test]

@@ -272,6 +272,7 @@ async fn logging_in_over_https_sets_a_secure_cookie() {
     let svc = Service::open(ServiceConfig {
         data_dir: data.path().join("data"),
         local_root: local.path().to_owned(),
+        hidden: Default::default(),
         concurrency: 1,
         ssh: SshOptions::default(),
     })

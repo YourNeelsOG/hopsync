@@ -146,6 +146,38 @@ function errorText(data: unknown): string | null {
  * One request. The `T` is trusted, not checked: the only peer is the daemon that served this page
  * (same origin, CSP), and these types mirror its structs.
  */
+/** The file route of this box (`server` null) or a connected server. */
+export function fileRoute(server: number | null): string {
+  return server === null ? "/api/local/file" : `/api/servers/${server}/file`;
+}
+
+/** Sends a file from this computer to `path` under a root folder. XHR, because fetch reports no upload progress. */
+export function uploadFile(server: number | null, path: string, file: File, overwrite: boolean, onProgress: (sent: number) => void): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const query = new URLSearchParams({ path, overwrite: String(overwrite) });
+    xhr.open("PUT", `${fileRoute(server)}?${query.toString()}`);
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.upload.onprogress = (ev) => onProgress(ev.loaded);
+    xhr.onerror = () => reject(new ApiError(0, "Hopsync is not reachable. Is the daemon running?"));
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve();
+        return;
+      }
+      let text = `failed with status ${xhr.status}`;
+      try {
+        const data: unknown = JSON.parse(xhr.responseText);
+        if (data && typeof data === "object" && "error" in data && typeof data.error === "string") text = data.error;
+      } catch {
+        // Not JSON: keep the status.
+      }
+      reject(new ApiError(xhr.status, text));
+    };
+    xhr.send(file);
+  });
+}
+
 export async function api<T>(method: string, path: string, body?: unknown): Promise<T> {
   const init: RequestInit = { method, credentials: "same-origin" };
   if (body !== undefined) {

@@ -297,3 +297,112 @@ async fn concurrent_last_chunks_finalize_every_file() {
         .count();
     assert_eq!(parts, 0);
 }
+
+/// A folder outside the remote root, with a symlink to it inside the root.
+fn linked_outside(e: &Env) -> std::path::PathBuf {
+    let outside = e.sshd.dir().join("outside");
+    std::fs::create_dir(&outside).expect("mkdir");
+    std::fs::create_dir(outside.join("sub")).expect("mkdir");
+    std::fs::write(outside.join("secret"), b"secret").expect("write");
+    std::fs::write(outside.join("sub/secret"), b"secret").expect("write");
+    std::os::unix::fs::symlink(&outside, e.remote_path("link")).expect("symlink");
+    outside
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pull_does_not_pass_through_a_symlink_on_the_server() {
+    let Some(e) = env() else { return };
+    linked_outside(&e);
+    assert!(matches!(
+        hopsync::engine::pull_file(
+            &e.remote,
+            &rel("link/secret"),
+            &e.local,
+            &rel("got"),
+            &opts()
+        )
+        .await,
+        Err(TransferError::SymlinkOnTheWay(_))
+    ));
+    assert!(!e.local_path("got").exists());
+    assert!(matches!(
+        pull_tree(
+            &e.remote,
+            &rel("link/sub"),
+            &e.local,
+            &rel("gotdir"),
+            &opts()
+        )
+        .await,
+        Err(TransferError::SymlinkOnTheWay(_))
+    ));
+    assert!(!e.local_path("gotdir").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_push_does_not_pass_through_a_symlink_on_the_server() {
+    let Some(e) = env() else { return };
+    let outside = linked_outside(&e);
+    std::fs::write(e.local_path("f"), b"data").expect("write");
+    std::fs::create_dir(e.local_path("d")).expect("mkdir");
+    std::fs::write(e.local_path("d/f"), b"data").expect("write");
+
+    assert!(matches!(
+        hopsync::engine::push_file(&e.local, &rel("f"), &e.remote, &rel("link/new"), &opts()).await,
+        Err(TransferError::SymlinkOnTheWay(_))
+    ));
+    assert!(matches!(
+        push_tree(&e.local, &rel("d"), &e.remote, &rel("link/newdir"), &opts()).await,
+        Err(TransferError::SymlinkOnTheWay(_))
+    ));
+    assert!(matches!(
+        push_tree(
+            &e.local,
+            &rel("d"),
+            &e.remote,
+            &rel("link/sub/newdir"),
+            &opts()
+        )
+        .await,
+        Err(TransferError::SymlinkOnTheWay(_))
+    ));
+    // The destination itself being a link was already refused, and stays refused.
+    assert!(
+        push_tree(&e.local, &rel("d"), &e.remote, &rel("link"), &opts())
+            .await
+            .is_err()
+    );
+
+    let mut names: Vec<_> = std::fs::read_dir(&outside)
+        .expect("list")
+        .map(|n| n.expect("entry").file_name())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["secret", "sub"], "nothing arrived outside the root");
+    assert_eq!(
+        std::fs::read_dir(outside.join("sub"))
+            .expect("list")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_folder_path_still_transfers_after_the_symlink_check() {
+    let Some(e) = env() else { return };
+    std::fs::create_dir_all(e.remote_path("a/b")).expect("mkdir");
+    std::fs::write(e.local_path("f"), b"data").expect("write");
+    hopsync::engine::push_file(&e.local, &rel("f"), &e.remote, &rel("a/b/f"), &opts())
+        .await
+        .expect("push");
+    hopsync::engine::pull_file(&e.remote, &rel("a/b/f"), &e.local, &rel("back"), &opts())
+        .await
+        .expect("pull");
+    assert_eq!(std::fs::read(e.local_path("back")).expect("read"), b"data");
+    // A missing parent reports as before, not as a symlink.
+    assert!(matches!(
+        hopsync::engine::push_file(&e.local, &rel("f"), &e.remote, &rel("no/such/f"), &opts())
+            .await,
+        Err(TransferError::MissingDirectory(_))
+    ));
+}

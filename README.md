@@ -82,6 +82,49 @@ Then go to `http://127.0.0.1:7890`. The tunnel works in public mode too.
 Setup asks which folder Hopsync may use. It refuses a home folder, because writing to `~/.ssh` or
 `~/.bashrc` would let a web UI login run commands. Choose a subfolder such as `~/downloads`.
 
+### See all your files
+
+By default the web UI stays in that one folder. To see everything you already have, turn on full
+access, either when setup asks, or at any time with:
+
+```bash
+hopsync setup --full-access
+```
+
+| The box has | The web UI reaches | Hidden from it |
+|---|---|---|
+| Root | The whole box, as root | `/proc`, `/sys`, `/dev` and `/run` |
+| No root | Your home folder, as you | Anything hidden directly in your home, such as `~/.ssh`, `~/.bashrc` and `~/.config` |
+
+> [!WARNING]
+> With full access on a root box, anyone who gets your web UI password controls the server. They could
+> overwrite system files, and files Hopsync writes belong to root. Use a long password, and prefer
+> `--local-only` with an SSH tunnel if you can.
+
+### Upload and download from your computer
+
+In either panel, this box or a connected server, the upload button sends files from your computer to the
+open folder, and the download button saves the ticked files to your computer. Files going to or from a
+server pass through this box over SSH. Folders can't be saved this way yet.
+
+### Settings file
+
+The same choice is in a file you can edit:
+
+| The box has | File |
+|---|---|
+| Root | `/etc/hopsync/config.toml` |
+| No root | `~/.config/hopsync/config.toml` |
+
+```toml
+access = "full"           # or "folder"
+folder = "/srv/hopsync"   # used when access is "folder"
+```
+
+Apply a change with `hopsync restart`. `systemctl restart hopsync` alone does not apply it, because
+the choice decides which account the service runs as. A mistake in the file stops with its line number
+and changes nothing.
+
 Check on the service with:
 
 ```bash

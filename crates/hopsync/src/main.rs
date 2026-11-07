@@ -115,6 +115,13 @@ enum Cmd {
         /// The only local folder transfers can use. Asked for on a terminal if not given.
         #[arg(long, value_name = "DIR")]
         folder: Option<String>,
+        /// Let the web UI read and write this whole box as root, or your whole home folder without
+        /// root. A stolen web password then controls that much. Asked for on a terminal.
+        #[arg(long, conflicts_with = "folder_only")]
+        full_access: bool,
+        /// Keep the web UI to the one folder. This is the default.
+        #[arg(long)]
+        folder_only: bool,
         /// Port for the web UI. Without it, the first free port from 7890.
         #[arg(long)]
         port: Option<u16>,
@@ -182,6 +189,9 @@ struct ServeArgs {
     /// Local directory that every local path stays under (default: the home directory).
     #[arg(long, value_name = "DIR")]
     root: Option<PathBuf>,
+    /// The whole of --root is open to the web UI, except what `hopsync setup` documents as hidden.
+    #[arg(long, requires = "root")]
+    full_access: bool,
     #[arg(long, value_name = "FILE")]
     socket: Option<PathBuf>,
     /// Jobs that run at once.
@@ -364,6 +374,8 @@ async fn run(cli: Cli) -> Result<(), Error> {
         Cmd::Serve(a) => serve(a).await,
         Cmd::Setup {
             folder,
+            full_access,
+            folder_only,
             port,
             public,
             local_only,
@@ -374,6 +386,11 @@ async fn run(cli: Cli) -> Result<(), Error> {
         } => {
             let o = hopsync::setup::SetupOptions {
                 folder: folder.clone(),
+                full_access: match (*full_access, *folder_only) {
+                    (true, _) => Some(true),
+                    (_, true) => Some(false),
+                    _ => None,
+                },
                 port: *port,
                 public: match (*public || tls_cert.is_some(), *local_only) {
                     (true, _) => Some(true),
@@ -606,12 +623,24 @@ async fn serve(a: &ServeArgs) -> Result<(), Error> {
             names: a.tls_name.clone(),
         }),
     };
+    if a.full_access {
+        eprintln!(
+            "hopsync: FULL ACCESS: the web UI reads and writes everything under {}. Anyone with its \
+             password controls that much.",
+            root.display()
+        );
+    }
     hopsync::daemon::run(hopsync::daemon::DaemonConfig {
         tls,
         listen: a.listen,
         socket,
         service: hopsync::service::ServiceConfig {
             data_dir,
+            hidden: if a.full_access {
+                hopsync::paths::Hidden::for_full_access(&root)
+            } else {
+                hopsync::paths::Hidden::Nothing
+            },
             local_root: root,
             concurrency: usize::from(a.jobs),
             ssh: hopsync::ssh::SshOptions::default(),
