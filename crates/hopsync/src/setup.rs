@@ -10,7 +10,8 @@
 //! Setup adds no way to set a password. It starts the daemon, then calls the same `/api/setup` the
 //! web page uses, with the token only this account can read. First it checks in `/proc/net/tcp` that
 //! the port belongs to the service's account: on a shared box, another customer could be listening
-//! there to collect the password. All commands here use fixed arguments and no shell, and every path
+//! there to collect the password. That call stays on loopback even when the web UI is public, where
+//! the listener still takes plain HTTP from this machine. All commands here use fixed arguments and no shell, and every path
 //! that reaches a unit file or crontab passes `check_path_text`.
 
 use std::io::{BufRead, IsTerminal, Write};
@@ -169,12 +170,106 @@ pub fn service_owner(folder: &Path, owner: Option<&str>) -> Fallible<String> {
 pub struct UnitSpec {
     pub folder: PathBuf,
     pub port: u16,
+    pub public: Option<Public>,
     /// System only: the account and its primary group.
     pub user: String,
     pub group: String,
     /// User only: the binary and the data directory.
     pub exec: PathBuf,
     pub data_dir: PathBuf,
+}
+
+/// The web UI on this server's own address, over HTTPS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Public {
+    /// The address people open, and the name in a generated certificate.
+    pub address: String,
+    /// The user's own certificate and key; a generated certificate when `None`.
+    #[serde(default)]
+    pub own_cert: Option<(String, String)>,
+}
+
+/// The daemon arguments that decide where it listens and how.
+pub fn listen_args(port: u16, public: Option<&Public>) -> Fallible<Vec<String>> {
+    let Some(p) = public else {
+        return Ok(vec!["--listen".into(), format!("127.0.0.1:{port}")]);
+    };
+    let mut args = vec!["--listen".into(), format!("0.0.0.0:{port}"), "--tls".into()];
+    match &p.own_cert {
+        Some((cert, key)) => {
+            check_path_text(cert)?;
+            check_path_text(key)?;
+            args.extend(["--tls-cert".into(), cert.clone()]);
+            args.extend(["--tls-key".into(), key.clone()]);
+        }
+        None => {
+            check_path_text(&p.address)?;
+            args.extend(["--tls-name".into(), p.address.clone()]);
+        }
+    }
+    Ok(args)
+}
+
+/// How a unit's daemon is exposed, read back from its command line.
+pub fn parse_public(unit: &str) -> Option<Public> {
+    let exec = unit.lines().find_map(|l| l.strip_prefix("ExecStart="))?;
+    let words: Vec<&str> = exec.split_whitespace().collect();
+    let after = |flag: &str| {
+        words
+            .iter()
+            .position(|w| *w == flag)
+            .and_then(|i| words.get(i + 1))
+            .map(|v| (*v).to_owned())
+    };
+    if !words.contains(&"--tls") {
+        return None;
+    }
+    let own_cert = after("--tls-cert").zip(after("--tls-key"));
+    let address = after("--tls-name").or_else(|| own_cert.as_ref().map(|_| String::new()))?;
+    Some(Public { address, own_cert })
+}
+
+/// The IPv4 address a person reached this box on. `SSH_CONNECTION` is the address that demonstrably
+/// works from their side; IPv6 is left out because the public listener is IPv4 (Decision log).
+pub fn address_from_ssh(ssh_connection: Option<&str>) -> Option<String> {
+    let ip = ssh_connection?.split_whitespace().nth(2)?;
+    let parsed: Ipv4Addr = ip.parse().ok()?;
+    (!parsed.is_loopback()).then(|| parsed.to_string())
+}
+
+/// The address this box goes out on. Connecting a UDP socket sends nothing: it only picks a route.
+fn address_from_route() -> Option<String> {
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => {
+            Some(ip.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// The URL people open, with no port when `address` is empty because a certificate of their own
+/// names the host and setup cannot know which of its names they use.
+fn public_url(public: &Public, port: u16) -> String {
+    let host = if public.address.is_empty() {
+        "your-domain"
+    } else {
+        public.address.as_str()
+    };
+    format!("https://{host}:{port}")
+}
+
+/// Whether `ufw status` output shows a firewall that would block `port`.
+pub fn ufw_blocks(status: &str, port: u16) -> bool {
+    if !status.lines().any(|l| l.trim() == "Status: active") {
+        return false;
+    }
+    let number = port.to_string();
+    !status.lines().any(|l| {
+        let rule = l.split_whitespace().next().unwrap_or("");
+        l.contains("ALLOW") && (rule == number || rule == format!("{port}/tcp"))
+    })
 }
 
 fn swap(text: &str, from: &str, to: &str) -> Fallible<String> {
@@ -203,7 +298,11 @@ pub fn render_system_unit(s: &UnitSpec) -> Fallible<String> {
     let mut u = body(SYSTEM_TEMPLATE).to_owned();
     u = swap(&u, "User=hopsync", &format!("User={}", s.user))?;
     u = swap(&u, "Group=hopsync", &format!("Group={}", s.group))?;
-    u = swap(&u, "127.0.0.1:7890", &format!("127.0.0.1:{}", s.port))?;
+    u = swap(
+        &u,
+        "--listen 127.0.0.1:7890",
+        &listen_args(s.port, s.public.as_ref())?.join(" "),
+    )?;
     u = swap(&u, "/srv/hopsync", &folder)?;
     if under_home(&s.folder) {
         // An empty /home with only this folder in it, rather than opening every home to the service.
@@ -231,8 +330,8 @@ pub fn render_user_unit(s: &UnitSpec) -> Fallible<String> {
         body(USER_TEMPLATE),
         "%h/.local/bin/hopsync serve --listen 127.0.0.1:7890",
         &format!(
-            "{exec} serve --listen 127.0.0.1:{} --data-dir {data} --root {folder}",
-            s.port
+            "{exec} serve {} --data-dir {data} --root {folder}",
+            listen_args(s.port, s.public.as_ref())?.join(" ")
         ),
     )?;
     Ok(format!("{MARKER}\n{u}"))
@@ -484,8 +583,10 @@ fn tcp_table() -> String {
     std::fs::read_to_string("/proc/net/tcp").unwrap_or_default()
 }
 
+/// Free on every address: a holder of any one of them, on a shared box especially, blocks a public
+/// listener, and a wildcard holder blocks a loopback one.
 fn port_free(port: u16) -> bool {
-    TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).is_ok()
+    TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).is_ok()
 }
 
 /// The port to use: the running service's, an explicit one that is free, or the first free one.
@@ -594,12 +695,17 @@ fn stdin_line() -> Fallible<Zeroizing<String>> {
 pub struct SetupOptions {
     pub folder: Option<String>,
     pub port: Option<u16>,
+    /// `--public` or `--local-only`; asked for on a terminal when `None`.
+    pub public: Option<bool>,
+    /// `--tls-cert` and `--tls-key`.
+    pub own_cert: Option<(String, String)>,
     pub password_stdin: bool,
     pub plain: bool,
 }
 
 /// What the three modes differ in once the folder is known.
 struct Started {
+    public: Option<Public>,
     port: u16,
     uid: u32,
     data_dir: PathBuf,
@@ -654,8 +760,41 @@ pub fn run_setup(o: &SetupOptions) -> Fallible<()> {
         ui.skipped("Web UI password already set, keeping it");
     }
 
+    warn_about_firewall(&ui, &started);
     summary(&ui, mode, &started);
     Ok(())
+}
+
+/// The summary lines for a public web UI, with the fingerprint the browser's warning must match.
+fn public_rows(p: &Public, s: &Started, tunnel: String) -> Vec<(String, String)> {
+    let mut rows = vec![("Open".to_owned(), public_url(p, s.port))];
+    if p.own_cert.is_none() {
+        let cert = s.data_dir.join("tls-cert.pem");
+        rows.push((
+            "Browser warns".to_owned(),
+            "normal here. Accept only if SHA-256 matches:".to_owned(),
+        ));
+        rows.push((
+            "SHA-256".to_owned(),
+            crate::tls::fingerprint_of(&cert).unwrap_or_else(|e| e),
+        ));
+    }
+    rows.push(("Or tunnel".to_owned(), tunnel));
+    rows
+}
+
+/// A firewall this setup can see and will not change on its own.
+fn warn_about_firewall(ui: &Ui, s: &Started) {
+    if s.public.is_some()
+        && is_root()
+        && let Ok(status) = run("ufw", &["status"])
+        && ufw_blocks(&status, s.port)
+    {
+        ui.warn(&format!(
+            "ufw is blocking the web UI. To let it through, run: ufw allow {}/tcp",
+            s.port
+        ));
+    }
 }
 
 fn summary(ui: &Ui, mode: Mode, s: &Started) {
@@ -664,17 +803,18 @@ fn summary(ui: &Ui, mode: Mode, s: &Started) {
         .ok()
         .or_else(|| run("id", &["-un"]).ok());
     let ssh = std::env::var("SSH_CONNECTION").ok();
-    let mut rows = vec![
-        (
-            "On your PC".to_owned(),
-            tunnel_command(s.port, user.as_deref(), ssh.as_deref()),
-        ),
-        (
-            "Then open".to_owned(),
-            format!("http://127.0.0.1:{}", s.port),
-        ),
-        ("Files folder".to_owned(), s.folder.display().to_string()),
-    ];
+    let tunnel = tunnel_command(s.port, user.as_deref(), ssh.as_deref());
+    let mut rows = match &s.public {
+        Some(p) => public_rows(p, s, tunnel),
+        None => vec![
+            ("On your PC".to_owned(), tunnel),
+            (
+                "Then open".to_owned(),
+                format!("http://127.0.0.1:{}", s.port),
+            ),
+        ],
+    };
+    rows.extend([("Files folder".to_owned(), s.folder.display().to_string())]);
     rows.extend(
         command_rows(mode)
             .into_iter()
@@ -691,6 +831,48 @@ fn summary(ui: &Ui, mode: Mode, s: &Started) {
         Mode::Background => "Hopsync is running in the background",
     };
     ui.panel(title, &rows);
+}
+
+/// Whether to open the web UI on this server's address: as asked by a flag, as chosen last time, as
+/// answered now, or not. Scripts that say nothing keep the tunnel, so nothing becomes public unasked.
+fn pick_public(ui: &Ui, o: &SetupOptions, previous: Option<&Public>) -> Fallible<Option<Public>> {
+    let ssh = std::env::var("SSH_CONNECTION").ok();
+    let found = address_from_ssh(ssh.as_deref()).or_else(address_from_route);
+    if let Some((cert, key)) = &o.own_cert {
+        return Ok(Some(Public {
+            address: found.unwrap_or_default(),
+            own_cert: Some((cert.clone(), key.clone())),
+        }));
+    }
+    if o.public == Some(false) {
+        return Ok(None);
+    }
+    if let Some(p) = previous {
+        return Ok(Some(p.clone()));
+    }
+    let asked = o.public == Some(true);
+    let address = match found {
+        Some(a) => a,
+        None if asked => {
+            return Err(
+                "could not work out this server's address, so the certificate cannot name it. \
+                 Run setup over SSH, so it can read the address you connected to."
+                    .into(),
+            );
+        }
+        None => return Ok(None),
+    };
+    if !asked && (!std::io::stdin().is_terminal() || o.password_stdin) {
+        return Ok(None);
+    }
+    let yes = asked
+        || ui
+            .confirm_yes(&format!("Open the web UI at https://{address}?"))
+            .map_err(|e| e.to_string())?;
+    Ok(yes.then_some(Public {
+        address,
+        own_cert: None,
+    }))
 }
 
 /// The folder to use: as given, as chosen last time, as answered now, or the default.
@@ -775,6 +957,7 @@ fn setup_system(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
         Path::new(SYSTEM_DATA),
     )?;
     let port = choose_port(o.port, parsed.as_ref().map(|p| p.1), running)?;
+    let public = pick_public(ui, o, previous.as_deref().and_then(parse_public).as_ref())?;
 
     if run("id", &["-u", SERVICE_USER]).is_err() {
         ui.step("Creating the hopsync service account", || {
@@ -834,6 +1017,7 @@ fn setup_system(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
     let spec = UnitSpec {
         folder: folder.clone(),
         port,
+        public: public.clone(),
         user,
         group,
         exec: PathBuf::from(SYSTEM_BIN),
@@ -868,6 +1052,7 @@ fn setup_system(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
         })
         .map_err(|e| with_journal(Mode::System, e))?;
     Ok(Started {
+        public,
         port,
         uid,
         data_dir: PathBuf::from(SYSTEM_DATA),
@@ -922,10 +1107,12 @@ fn setup_user(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
         &data_dir,
     )?;
     let port = choose_port(o.port, parsed.as_ref().map(|p| p.1), running)?;
+    let public = pick_public(ui, o, previous.as_deref().and_then(parse_public).as_ref())?;
     let exec = own_binary_path(&home_dir)?;
     let spec = UnitSpec {
         folder: folder.clone(),
         port,
+        public: public.clone(),
         user: String::new(),
         group: String::new(),
         exec: exec.clone(),
@@ -965,6 +1152,7 @@ fn setup_user(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
         );
     }
     Ok(Started {
+        public,
         port,
         uid,
         data_dir,
@@ -990,6 +1178,8 @@ struct BackgroundState {
     exec: PathBuf,
     folder: PathBuf,
     port: u16,
+    #[serde(default)]
+    public: Option<Public>,
 }
 
 fn state_path(data_dir: &Path) -> PathBuf {
@@ -1029,8 +1219,8 @@ fn background_start(data_dir: &Path, state: &BackgroundState) -> Fallible<()> {
     };
     let (out, err) = (open()?, open()?);
     let mut cmd = Command::new(&state.exec);
-    cmd.args(["serve", "--listen"])
-        .arg(format!("127.0.0.1:{}", state.port))
+    cmd.arg("serve")
+        .args(listen_args(state.port, state.public.as_ref())?)
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--root")
@@ -1134,6 +1324,7 @@ fn setup_background(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
         &data_dir,
     )?;
     let port = choose_port(o.port, previous.as_ref().map(|s| s.port), running)?;
+    let public = pick_public(ui, o, previous.as_ref().and_then(|s| s.public.as_ref()))?;
     let exec = own_binary_path(&home_dir)?;
     ready_own_folder(ui, &folder)?;
     private_dir(&data_dir)?;
@@ -1142,10 +1333,14 @@ fn setup_background(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
         exec: exec.clone(),
         folder: folder.clone(),
         port,
+        public: public.clone(),
     };
-    let changed = previous
-        .as_ref()
-        .is_none_or(|p| p.folder != state.folder || p.port != state.port || p.exec != state.exec);
+    let changed = previous.as_ref().is_none_or(|p| {
+        p.folder != state.folder
+            || p.port != state.port
+            || p.exec != state.exec
+            || p.public != state.public
+    });
     if changed {
         let text = serde_json::to_vec(&state).map_err(|e| e.to_string())?;
         write_atomic(&state_path(&data_dir), &text, 0o600)?;
@@ -1188,6 +1383,7 @@ fn setup_background(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
         Err(_) => ui.warn("This box does not allow cron, so run `hopsync start` after a reboot."),
     }
     Ok(Started {
+        public,
         port,
         uid,
         data_dir,
@@ -1277,8 +1473,11 @@ fn background_control(what: Control) -> Fallible<()> {
         Control::Status => {
             match running_pid(&data_dir) {
                 Some(pid) => println!(
-                    "hopsync: running in the background, pid {pid}, web UI on http://127.0.0.1:{}",
-                    state.port
+                    "hopsync: running in the background, pid {pid}, web UI on {}",
+                    state.public.as_ref().map_or_else(
+                        || format!("http://127.0.0.1:{}", state.port),
+                        |p| public_url(p, state.port)
+                    )
                 ),
                 None => println!("hopsync: stopped. Start it with `hopsync start`."),
             }
@@ -1414,6 +1613,7 @@ mod tests {
 
     fn spec(folder: &str) -> UnitSpec {
         UnitSpec {
+            public: None,
             folder: PathBuf::from(folder),
             port: 8123,
             user: "alice".into(),
@@ -1434,6 +1634,101 @@ mod tests {
                 .unwrap_err()
                 .contains("as root")
         );
+    }
+
+    #[test]
+    fn a_public_unit_listens_everywhere_over_https_and_reads_back() {
+        let mut s = spec("/srv/data");
+        s.public = Some(Public {
+            address: "203.0.113.7".into(),
+            own_cert: None,
+        });
+        for unit in [
+            render_system_unit(&s).unwrap(),
+            render_user_unit(&s).unwrap(),
+        ] {
+            assert!(
+                unit.contains("--listen 0.0.0.0:8123 --tls --tls-name 203.0.113.7 "),
+                "{unit}"
+            );
+            assert_eq!(parse_unit(&unit).unwrap().1, 8123);
+            assert_eq!(parse_public(&unit), s.public);
+        }
+    }
+
+    #[test]
+    fn an_unasked_unit_stays_on_loopback_with_no_tls() {
+        let s = spec("/srv/data");
+        for unit in [
+            render_system_unit(&s).unwrap(),
+            render_user_unit(&s).unwrap(),
+        ] {
+            assert!(unit.contains("--listen 127.0.0.1:8123 "), "{unit}");
+            assert!(!unit.contains("--tls"), "{unit}");
+            assert_eq!(parse_public(&unit), None);
+        }
+    }
+
+    #[test]
+    fn an_own_certificate_reads_back_and_a_bad_path_cannot_reach_the_unit() {
+        let mut s = spec("/srv/data");
+        let own = Some(("/etc/hs/cert.pem".to_owned(), "/etc/hs/key.pem".to_owned()));
+        s.public = Some(Public {
+            address: String::new(),
+            own_cert: own.clone(),
+        });
+        let unit = render_system_unit(&s).unwrap();
+        assert!(unit.contains("--tls-cert /etc/hs/cert.pem --tls-key /etc/hs/key.pem"));
+        assert_eq!(parse_public(&unit).unwrap().own_cert, own);
+
+        for bad in ["/x y.pem", "/x\nExecStartPre=/bin/sh"] {
+            s.public = Some(Public {
+                address: String::new(),
+                own_cert: Some((bad.to_owned(), "/k.pem".to_owned())),
+            });
+            assert!(render_system_unit(&s).is_err(), "{bad}");
+        }
+        s.public = Some(Public {
+            address: "1.2.3.4 --evil".to_owned(),
+            own_cert: None,
+        });
+        assert!(render_system_unit(&s).is_err());
+    }
+
+    #[test]
+    fn the_address_comes_from_the_ssh_connection_when_it_can_be_used() {
+        let from = |c| address_from_ssh(Some(c));
+        assert_eq!(
+            from("198.51.100.1 5000 203.0.113.7 22").as_deref(),
+            Some("203.0.113.7")
+        );
+        assert_eq!(from("2001:db8::1 5000 2001:db8::2 22"), None);
+        assert_eq!(from("127.0.0.1 5000 127.0.0.1 22"), None);
+        assert_eq!(from("garbage"), None);
+        assert_eq!(address_from_ssh(None), None);
+    }
+
+    #[test]
+    fn an_older_background_state_file_still_reads_as_local() {
+        let old = r#"{"exec":"/x/hopsync","folder":"/x/f","port":7890}"#;
+        let state: BackgroundState = serde_json::from_str(old).unwrap();
+        assert_eq!(state.public, None);
+    }
+
+    #[test]
+    fn ufw_is_noticed_only_when_it_would_block_the_port() {
+        let active = "Status: active\n\nTo Action From\n-- ------ ----\n22/tcp ALLOW Anywhere\n";
+        assert!(ufw_blocks(active, 7890));
+        assert!(!ufw_blocks(
+            &format!("{active}7890/tcp ALLOW Anywhere\n"),
+            7890
+        ));
+        assert!(!ufw_blocks(&format!("{active}7890 ALLOW Anywhere\n"), 7890));
+        assert!(ufw_blocks(
+            &format!("{active}17890/tcp ALLOW Anywhere\n"),
+            7890
+        ));
+        assert!(!ufw_blocks("Status: inactive\n", 7890));
     }
 
     #[test]

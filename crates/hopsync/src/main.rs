@@ -115,9 +115,26 @@ enum Cmd {
         /// The only local folder transfers can use. Asked for on a terminal if not given.
         #[arg(long, value_name = "DIR")]
         folder: Option<String>,
-        /// Port for the web UI on 127.0.0.1. Without it, the first free port from 7890.
+        /// Port for the web UI. Without it, the first free port from 7890.
         #[arg(long)]
         port: Option<u16>,
+        /// Open the web UI on this server's address, over HTTPS. Asked for on a terminal.
+        #[arg(long, conflicts_with = "local_only")]
+        public: bool,
+        /// Keep the web UI on 127.0.0.1, reached through an SSH tunnel.
+        #[arg(long)]
+        local_only: bool,
+        /// Your own certificate chain in PEM, for a domain you have. Implies --public.
+        #[arg(
+            long,
+            value_name = "FILE",
+            requires = "tls_key",
+            conflicts_with = "local_only"
+        )]
+        tls_cert: Option<String>,
+        /// The private key of --tls-cert, in PEM.
+        #[arg(long, value_name = "FILE", requires = "tls_cert")]
+        tls_key: Option<String>,
         /// Read the admin password from a line on standard input, for scripts.
         #[arg(long)]
         password_stdin: bool,
@@ -155,8 +172,8 @@ enum Cmd {
 
 #[derive(Args)]
 struct ServeArgs {
-    /// Address for the web UI and API. Anything but loopback is plain HTTP on the network:
-    /// put a TLS reverse proxy in front.
+    /// Address for the web UI and API. Anything but loopback needs --tls, or a TLS reverse proxy
+    /// in front: it would be plain HTTP on the network.
     #[arg(long, default_value = "127.0.0.1:7890")]
     listen: std::net::SocketAddr,
     /// Database, vault key and pinned host keys (default: $XDG_DATA_HOME/hopsync).
@@ -173,6 +190,25 @@ struct ServeArgs {
     /// Mark session cookies Secure: a TLS reverse proxy serves the UI over HTTPS.
     #[arg(long)]
     secure_cookies: bool,
+    /// Serve HTTPS with a certificate generated in the data directory, or the one named by
+    /// --tls-cert and --tls-key.
+    #[arg(long)]
+    tls: bool,
+    /// A name or IP address for the generated certificate. Repeat for more.
+    #[arg(long, value_name = "NAME", requires = "tls")]
+    tls_name: Vec<String>,
+    /// Your own certificate chain, in PEM. Read at start, so a renewal needs a restart.
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "tls",
+        requires = "tls_key",
+        conflicts_with = "tls_name"
+    )]
+    tls_cert: Option<PathBuf>,
+    /// The private key of --tls-cert, in PEM.
+    #[arg(long, value_name = "FILE", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -287,7 +323,10 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             // Errors carry text the server chose (status messages, names): never raw to a terminal.
-            eprintln!("hopsync: error: {}", printable(&e.to_string()));
+            eprintln!(
+                "hopsync: error: {}",
+                hopsync::cli::printable_lines(&e.to_string())
+            );
             ExitCode::FAILURE
         }
     }
@@ -326,12 +365,22 @@ async fn run(cli: Cli) -> Result<(), Error> {
         Cmd::Setup {
             folder,
             port,
+            public,
+            local_only,
+            tls_cert,
+            tls_key,
             password_stdin,
             plain,
         } => {
             let o = hopsync::setup::SetupOptions {
                 folder: folder.clone(),
                 port: *port,
+                public: match (*public || tls_cert.is_some(), *local_only) {
+                    (true, _) => Some(true),
+                    (_, true) => Some(false),
+                    _ => None,
+                },
+                own_cert: tls_cert.clone().zip(tls_key.clone()),
                 password_stdin: *password_stdin,
                 plain: *plain,
             };
@@ -547,7 +596,18 @@ async fn serve(a: &ServeArgs) -> Result<(), Error> {
         .socket
         .clone()
         .unwrap_or_else(|| hopsync::daemon::default_socket(&data_dir));
+    let tls = match (&a.tls_cert, &a.tls_key) {
+        (Some(cert), Some(key)) => Some(hopsync::tls::Source::Files {
+            cert: cert.clone(),
+            key: key.clone(),
+        }),
+        _ => a.tls.then(|| hopsync::tls::Source::Generated {
+            data_dir: data_dir.clone(),
+            names: a.tls_name.clone(),
+        }),
+    };
     hopsync::daemon::run(hopsync::daemon::DaemonConfig {
+        tls,
         listen: a.listen,
         socket,
         service: hopsync::service::ServiceConfig {

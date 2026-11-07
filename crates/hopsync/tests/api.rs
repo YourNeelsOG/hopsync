@@ -54,7 +54,7 @@ async fn daemon() -> Daemon {
         let shutdown = async {
             let _ = stopped.await;
         };
-        daemon::serve(s, tcp, sock, false, shutdown, addr)
+        daemon::serve(s, tcp, sock, false, None, shutdown, addr)
             .await
             .expect("serve");
     });
@@ -615,6 +615,7 @@ async fn shutdown_does_not_wait_for_open_event_streams() {
         tcp,
         sock,
         false,
+        None,
         async {
             let _ = stopped.await;
         },

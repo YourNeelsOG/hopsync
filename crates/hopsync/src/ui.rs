@@ -493,6 +493,12 @@ impl Ui {
         Ok(matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes"))
     }
 
+    /// Yes or no, for a question whose usual answer is yes. Enter means yes.
+    pub fn confirm_yes(&self, prompt: &str) -> std::io::Result<bool> {
+        let answer = self.ask_line(prompt, "Y/n")?;
+        Ok(!matches!(answer.to_ascii_lowercase().as_str(), "n" | "no"))
+    }
+
     /// Reads a password from a terminal with no echo, showing a dot per character. The dots turn
     /// green once there are `min` characters. `None` means the user pressed Ctrl-C.
     pub fn ask_password(
