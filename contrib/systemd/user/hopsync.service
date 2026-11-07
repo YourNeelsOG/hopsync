@@ -1,4 +1,5 @@
-# User unit, for shared seedboxes without root:
+# User unit, for shared seedboxes without root. `hopsync setup` installs this file with your values.
+# To do it by hand:
 #   mkdir -p ~/.config/systemd/user && cp hopsync.service ~/.config/systemd/user/
 #   systemctl --user enable --now hopsync
 #   loginctl enable-linger "$USER"    # keep it running after you log out, if allowed

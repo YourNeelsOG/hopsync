@@ -101,3 +101,5 @@ jobs:
       - name: Password install against OpenSSH in a container
         working-directory: crates/hopsync/web
         run: pnpm e2e:password
+      - name: Installer on clean distros
+        run: contrib/release/install-test.sh
