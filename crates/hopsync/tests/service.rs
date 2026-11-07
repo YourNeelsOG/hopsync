@@ -436,22 +436,18 @@ async fn an_idle_browse_connection_is_closed_and_reopens_on_demand() {
         .await
         .expect("trust");
     svc.list_remote(s.id, "").await.expect("list");
-    assert_eq!(
-        e.sshd.signal_sftp_servers("0"),
-        1,
-        "browsing keeps one session"
-    );
+    assert_eq!(e.sshd.sftp_server_count(), 1, "browsing keeps one session");
 
     assert_eq!(
         svc.close_idle_browse(Duration::from_secs(3600)),
         0,
         "a connection used just now stays open"
     );
-    assert_eq!(e.sshd.signal_sftp_servers("0"), 1);
+    assert_eq!(e.sshd.sftp_server_count(), 1);
 
     assert_eq!(svc.close_idle_browse(Duration::ZERO), 1);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while e.sshd.signal_sftp_servers("0") != 0 {
+    while e.sshd.sftp_server_count() != 0 {
         assert!(
             std::time::Instant::now() < deadline,
             "the server still holds the session after it was closed"
@@ -460,7 +456,7 @@ async fn an_idle_browse_connection_is_closed_and_reopens_on_demand() {
     }
 
     svc.list_remote(s.id, "").await.expect("reopens on demand");
-    assert_eq!(e.sshd.signal_sftp_servers("0"), 1);
+    assert_eq!(e.sshd.sftp_server_count(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

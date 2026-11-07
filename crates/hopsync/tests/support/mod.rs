@@ -146,6 +146,11 @@ impl TestSshd {
         pids.len()
     }
 
+    /// How many `sftp-server` processes this sshd has running right now.
+    pub fn sftp_server_count(&self) -> usize {
+        descendants_named(self.child.id(), "sftp-server").len()
+    }
+
     /// Arguments for the system `ssh` client that reach this server with strict host-key checking.
     pub fn ssh_args(&self) -> Vec<String> {
         vec![
