@@ -355,6 +355,8 @@ Notes and results: `docs/phase0/`.
 | 2026-11-07 | Setup refuses folders with spaces or other shell, unit-file or cron characters | Each of those formats escapes differently, and one mistake is a command injection. A plain allowlist cannot get that wrong. A symlink covers the rare folder with a space. |
 | 2026-11-07 | A system service runs as the owner of an existing folder, or the `hopsync` account for a new one, and a root-owned folder is refused | Never root (CLAUDE.md section 3). Setup never runs `chown -R` on existing files unasked: on a seedbox those can be terabytes another program is using. |
 
+| 2026-11-07 | First release is `v1.0.0`, tagged `v1.0.0` and titled "prod v1.0.0" | Owner's choice, ahead of the Phase 5 plan and with built-in TLS, fuzzing, packages and an independent security review still open (README, Project status). The release workflow accepts only `vX.Y.Z` tags that match `Cargo.toml`, so a tag named `prodV1.0.0` would not start it. |
+
 ## 11. Open questions (owner to decide)
 
 1. **End-to-end verification default.** Re-reading the destination to hash it doubles destination read
