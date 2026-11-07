@@ -12,8 +12,8 @@ total_fail=0
 image() {
     tag=$1 from=$2 family=$3
     case "$family" in
-        deb) add='RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends systemd systemd-sysv dbus libpam-systemd curl python3 cron sudo procps passwd && rm -f /lib/systemd/system/getty* && systemctl mask systemd-logind.service 2>/dev/null; systemctl unmask systemd-logind.service' ;;
-        rpm) add='RUN dnf install -y -q systemd curl-minimal python3 cronie sudo procps-ng shadow-utils util-linux --allowerasing' ;;
+        deb) add='RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends systemd systemd-sysv dbus libpam-systemd curl openssl hostname python3 cron sudo procps passwd && rm -f /lib/systemd/system/getty* && systemctl mask systemd-logind.service 2>/dev/null; systemctl unmask systemd-logind.service' ;;
+        rpm) add='RUN dnf install -y -q systemd curl-minimal openssl hostname python3 cronie sudo procps-ng shadow-utils util-linux --allowerasing' ;;
     esac
     docker build -q -t "$tag" - >/dev/null <<EOF
 FROM $from

@@ -114,8 +114,21 @@ pub fn printable(s: &str) -> String {
         .collect()
 }
 
+/// `printable` for text that is meant to have several lines, such as an error with a log tail.
+pub fn printable_lines(s: &str) -> String {
+    s.split('\n').map(printable).collect::<Vec<_>>().join("\n")
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_multi_line_error_keeps_its_lines_and_loses_only_its_control_characters() {
+        assert_eq!(
+            printable_lines("failed. Last log lines:\nfirst\u{1b}[2J\nsecond\r"),
+            "failed. Last log lines:\nfirst\\u{1b}[2J\nsecond\\r"
+        );
+    }
 
     #[test]
     fn printable_escapes_control_characters_only() {

@@ -45,6 +45,9 @@ use crate::vault::{Vault, VaultError};
 const KEY_PURPOSE: &str = "ssh-key";
 const SNAPSHOT_EVERY: Duration = Duration::from_millis(500);
 const FLUSH_EVERY: Duration = Duration::from_secs(1);
+/// How long a browse connection stays open unused. It holds memory here and a session on the
+/// server, so an idle daemon, or one whose user has logged out, must not keep it.
+const BROWSE_IDLE: Duration = Duration::from_secs(180);
 /// Store setting: "true" while the user holds the queue. Not part of the settings API.
 const QUEUE_HELD: &str = "queue_held";
 /// Items a dry run returns; the counts cover everything.
@@ -260,8 +263,8 @@ pub struct Service {
     snapshot: watch::Sender<Arc<Snapshot>>,
     /// Set once the daemon is stopping; long-lived responses (event streams) end on it.
     stopping: watch::Sender<bool>,
-    /// Remotes kept warm for browsing, by server id.
-    browse: Mutex<HashMap<i64, Remote>>,
+    /// Remotes kept warm for browsing, by server id, each with when it was last used.
+    browse: Mutex<HashMap<i64, (Remote, Instant)>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -437,7 +440,13 @@ impl Service {
         tokio::spawn(async move {
             loop {
                 match weak.upgrade() {
-                    Some(me) => me.fill(),
+                    Some(me) => {
+                        me.fill();
+                        if me.close_idle_browse(BROWSE_IDLE) > 0 {
+                            // Hands the connection's buffers back to the system.
+                            tokio::task::spawn_blocking(crate::pool::release_free_memory);
+                        }
+                    }
                     None => break,
                 }
                 // The timeout only lets the loop notice that the service is gone.
@@ -455,6 +464,15 @@ impl Service {
                 }
             }
         });
+    }
+
+    /// Closes browse connections unused for at least `idle_for`, returning how many. The next
+    /// listing opens a new one. A listing still running keeps its own handle and finishes.
+    pub fn close_idle_browse(&self, idle_for: Duration) -> usize {
+        let mut browse = lock(&self.browse);
+        let before = browse.len();
+        browse.retain(|_, (_, used)| used.elapsed() < idle_for);
+        before - browse.len()
     }
 
     pub fn subscribe(&self) -> watch::Receiver<Arc<Snapshot>> {
@@ -839,18 +857,25 @@ impl Service {
     pub async fn list_remote(&self, server: i64, path: &str) -> Result<Vec<Entry>> {
         let rel = parse_rel(path)?;
         let s = self.store.server(server)?;
-        let cached = lock(&self.browse).get(&server).cloned();
+        let cached = lock(&self.browse).get_mut(&server).map(|(r, used)| {
+            *used = Instant::now();
+            r.clone()
+        });
         let remote = match cached {
             Some(r) => r,
             None => {
                 let r = self.remote(&s)?;
-                lock(&self.browse).insert(server, r.clone());
+                lock(&self.browse).insert(server, (r.clone(), Instant::now()));
                 r
             }
         };
         let mut opts = self.base_opts();
         opts.sftp.max_dir_entries = BROWSE_MAX_ENTRIES;
         let listed = remote.list(&rel, &opts).await;
+        // A slow listing counts as use up to the moment it ends.
+        if let Some((_, used)) = lock(&self.browse).get_mut(&server) {
+            *used = Instant::now();
+        }
         let listed = match listed {
             Ok(l) => l,
             Err(e) => {
@@ -1205,6 +1230,7 @@ impl Service {
                 &format!("server {}: {why}", job.spec.server),
             );
         }
+        let _ = tokio::task::spawn_blocking(crate::pool::release_free_memory).await;
         let _ = self.store.set_job_state(id, state, error.as_deref());
         let _ = self.store.add_job_event(
             id,

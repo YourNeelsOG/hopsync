@@ -182,7 +182,10 @@ impl Auth {
 
     fn verify(&self, password: &str, hash: &str) -> bool {
         let _one = self.hashing.lock().unwrap_or_else(|p| p.into_inner());
-        hasher().verify_password(password.as_bytes(), hash).is_ok()
+        let matches = hasher().verify_password(password.as_bytes(), hash).is_ok();
+        // Argon2 has just used 19 MiB, which an idle daemon should not keep.
+        crate::pool::release_free_memory();
+        matches
     }
 
     /// Sets the admin password with the setup token; returns a session token.

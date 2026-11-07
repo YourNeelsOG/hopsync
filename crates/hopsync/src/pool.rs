@@ -10,6 +10,18 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+/// Hands freed memory back to the kernel. Glibc keeps it in per-thread arenas otherwise, so a daemon
+/// that has finished a transfer would sit idle holding the size of its last buffer pool.
+pub fn release_free_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[allow(unsafe_code)]
+    // SAFETY: malloc_trim takes an integer, touches only the allocator's own state under its locks,
+    // and may be called from any thread at any time.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 #[derive(Clone)]
 pub struct BufferPool {
     inner: Arc<Inner>,

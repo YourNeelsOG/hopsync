@@ -8,8 +8,8 @@
 </p>
 
 <p align="center">
-  <a href="#performance">Performance</a> ·
   <a href="#install">Install</a> ·
+  <a href="#performance">Performance</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#security">Security</a> ·
   <a href="#documentation">Documentation</a> ·
@@ -24,6 +24,112 @@
 > [!NOTE]
 > Hopsync is early software. The transfer engine, daemon and web UI work and are tested, but there
 > has been no independent security review. See [Project status](#project-status).
+
+## Install
+
+You do not need root. Run one of these on the box that will run transfers:
+
+```bash
+curl -fsSL https://github.com/YourNeelsOG/hopsync/releases/latest/download/install.sh | sh
+```
+
+```bash
+wget -qO- https://github.com/YourNeelsOG/hopsync/releases/latest/download/install.sh | sh
+```
+
+Then start the service and web UI, and choose a password:
+
+```bash
+hopsync setup
+```
+
+To install an older release, set its tag. Every release stays available on the
+[releases page](https://github.com/YourNeelsOG/hopsync/releases):
+
+```bash
+curl -fsSL https://github.com/YourNeelsOG/hopsync/releases/latest/download/install.sh | HOPSYNC_VERSION=v1.0.0 sh
+```
+
+Setup asks whether to open the web UI on the server's own address. If you say yes, it serves HTTPS at
+`https://<server-ip>:7890` and prints the address. Plain `http://<server-ip>:7890` redirects there.
+
+Your browser warns on the first visit, because the certificate is one the box made for itself and no
+public authority vouches for a bare IP address. Compare the SHA-256 fingerprint in the warning with
+the one setup printed, and accept it only if they match. If they differ, something is intercepting the
+connection, so do not type your password. The daemon also writes the fingerprint to its log.
+
+If you have a domain, use your own certificate instead, and browsers will not warn:
+
+```bash
+hopsync setup --tls-cert /path/to/fullchain.pem --tls-key /path/to/privkey.pem
+```
+
+The service account must be able to read both files, and a renewed certificate needs
+`hopsync restart`.
+
+If the page does not load, check the firewall first. Setup warns about `ufw`, but it cannot see a
+firewall run by your provider, which you may need to open for that port.
+
+To keep the web UI off the network, answer no, or run `hopsync setup --local-only`. It then listens
+only on `127.0.0.1`, and you reach it through an SSH tunnel:
+
+```bash
+ssh -N -L 7890:127.0.0.1:7890 user@your-server
+```
+
+Then go to `http://127.0.0.1:7890`. The tunnel works in public mode too.
+
+Setup asks which folder Hopsync may use. It refuses a home folder, because writing to `~/.ssh` or
+`~/.bashrc` would let a web UI login run commands. Choose a subfolder such as `~/downloads`.
+
+Check on the service with:
+
+```bash
+systemctl status hopsync
+```
+
+Setup uses what the box allows, and prints the commands that work on it:
+
+| The box has | Hopsync runs as | Check it with |
+|---|---|---|
+| Root or sudo, and systemd | A system service, as an unprivileged user | `systemctl status hopsync` |
+| No root, and `systemctl --user` works | A user service | `systemctl --user status hopsync` |
+| No root and no `systemctl --user`, as on many shared seedboxes | A background process, restarted after a reboot through cron where allowed | `hopsync status` |
+
+With no root, use `sudo` to get the system service instead, if you have it:
+
+```bash
+sudo ~/.local/bin/hopsync setup
+```
+
+`hopsync status`, `start`, `stop`, `restart` and `logs` work the same in all three. If the default port
+is taken, for example by another customer on a shared box, setup picks the next free one.
+
+Run `hopsync setup` again at any time: it keeps your folder, port and password, and restarts the
+service only if something changed. For a new version, run the install command again, then
+`hopsync setup`. To remove the service and binary, run `hopsync uninstall`, which keeps your files
+and settings. `hopsync uninstall --purge` also deletes the settings, saved servers and keys.
+
+The install script supports `x86_64`, `aarch64` and `armv7`, and checks the archive against
+`sha256sums.txt`. Setup was tested under real systemd on Debian 12, Ubuntu 22.04 and Rocky 9.
+The folder for your files cannot contain spaces. Setup refuses a root-owned folder, because Hopsync
+never runs as root, and says how to fix it.
+
+To install by hand, download the archive for your machine from
+[Releases](https://github.com/YourNeelsOG/hopsync/releases), and copy `hopsync` to a folder on your
+`PATH`.
+
+The binary runs on Linux with glibc 2.17 or later, which covers CentOS 7 and every current Debian and
+Ubuntu. It has been run on CentOS 7, Debian 10 to 12 and Ubuntu 20.04 to 24.04, all on a recent
+kernel. It does not run on musl systems such as Alpine. Kernels older than 5.6 use a fallback to
+confine paths, and no release has been tested on one.
+
+To check a download, compare it with `sha256sums.txt` from the same release. Each archive also has a
+signed record of the build that made it, which the [GitHub CLI](https://cli.github.com) can verify:
+
+```bash
+gh attestation verify hopsync-x86_64-linux.tar.gz --repo YourNeelsOG/hopsync
+```
 
 ## Why Hopsync
 
@@ -97,73 +203,6 @@ These results have limits:
 
 [Method and caveats](docs/phase1/benchmarks.md) · [Medians as JSON](docs/benchmarks/results.json) ·
 [Benchmark script](benches/bench.py) · [Chart script](benches/charts.py)
-
-## Install
-
-You do not need root. Run one of these on the box that will run transfers:
-
-```bash
-curl -fsSL https://github.com/YourNeelsOG/hopsync/releases/latest/download/install.sh | sh
-```
-
-```bash
-wget -qO- https://github.com/YourNeelsOG/hopsync/releases/latest/download/install.sh | sh
-```
-
-Then start the service and web UI, and choose a password:
-
-```bash
-hopsync setup
-```
-
-Setup prints the command that opens the web UI from your own PC. Check on the service with:
-
-```bash
-systemctl status hopsync
-```
-
-Setup uses what the box allows, and prints the commands that work on it:
-
-| The box has | Hopsync runs as | Check it with |
-|---|---|---|
-| Root or sudo, and systemd | A system service, as an unprivileged user | `systemctl status hopsync` |
-| No root, and `systemctl --user` works | A user service | `systemctl --user status hopsync` |
-| No root and no `systemctl --user`, as on many shared seedboxes | A background process, restarted after a reboot through cron where allowed | `hopsync status` |
-
-With no root, use `sudo` to get the system service instead, if you have it:
-
-```bash
-sudo ~/.local/bin/hopsync setup
-```
-
-`hopsync status`, `start`, `stop`, `restart` and `logs` work the same in all three. If the default port
-is taken, for example by another customer on a shared box, setup picks the next free one.
-
-Run `hopsync setup` again at any time: it keeps your folder, port and password, and restarts the
-service only if something changed. For a new version, run the install command again, then
-`hopsync setup`. To remove the service and binary, run `hopsync uninstall`, which keeps your files
-and settings. `hopsync uninstall --purge` also deletes the settings, saved servers and keys.
-
-The install script supports `x86_64`, `aarch64` and `armv7`, and checks the archive against
-`sha256sums.txt`. Setup was tested under real systemd on Debian 12, Ubuntu 22.04 and Rocky 9.
-The folder for your files cannot contain spaces. Setup refuses a root-owned folder, because Hopsync
-never runs as root, and says how to fix it.
-
-To install by hand, download the archive for your machine from
-[Releases](https://github.com/YourNeelsOG/hopsync/releases), and copy `hopsync` to a folder on your
-`PATH`.
-
-The binary runs on Linux with glibc 2.17 or later, which covers CentOS 7 and every current Debian and
-Ubuntu. It has been run on CentOS 7, Debian 10 to 12 and Ubuntu 20.04 to 24.04, all on a recent
-kernel. It does not run on musl systems such as Alpine. Kernels older than 5.6 use a fallback to
-confine paths, and no release has been tested on one.
-
-To check a download, compare it with `sha256sums.txt` from the same release. Each archive also has a
-signed record of the build that made it, which the [GitHub CLI](https://cli.github.com) can verify:
-
-```bash
-gh attestation verify hopsync-x86_64-linux.tar.gz --repo YourNeelsOG/hopsync
-```
 
 ## Build from source
 

@@ -218,7 +218,7 @@ function Pane({
   const canList = servers === undefined || pane.server !== null;
 
   return (
-    <div id={`pane-${side}`} className="card flex min-h-[320px] min-w-0 flex-col overflow-hidden lg:min-h-0" aria-label={title} role="region">
+    <div id={`pane-${side}`} className="file-pane card flex min-h-[320px] min-w-0 flex-col overflow-hidden lg:min-h-0" aria-label={title} role="region">
       <div className="flex h-11 shrink-0 items-center gap-2 border-b border-line px-2.5">
         {servers ? (
           servers.length ? (
