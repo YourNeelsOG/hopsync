@@ -195,7 +195,13 @@ pub async fn serve(
     svc.start();
     let scheme = if tls.is_some() { "https" } else { "http" };
     let secure_cookies = secure_cookies || tls.is_some();
-    eprintln!("hopsync: web UI and API on {scheme}://{shown}/");
+    // A wildcard listen address is not something a browser can open.
+    let url = if shown.ip().is_unspecified() {
+        format!("{scheme}://<this server's address>:{}/", shown.port())
+    } else {
+        format!("{scheme}://{shown}/")
+    };
+    eprintln!("hopsync: web UI and API on {url}");
     if !shown.ip().is_loopback() && !secure_cookies {
         eprintln!(
             "hopsync: WARNING: serving plain HTTP on {shown}, which is not a loopback address. \
@@ -206,7 +212,7 @@ pub async fn serve(
     if svc.auth.needs_setup() {
         // The token itself never goes to the log (CLAUDE.md §3).
         eprintln!(
-            "hopsync: first start: open {scheme}://{shown}/ and set the admin password with the setup token in {}",
+            "hopsync: first start: open {url} and set the admin password with the setup token in {}",
             svc.setup_token_file().display()
         );
     }

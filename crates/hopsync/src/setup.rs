@@ -1501,6 +1501,16 @@ fn background_control(what: Control) -> Fallible<()> {
     }
 }
 
+/// The panel row saying what happened to the user's files. Plain "not touched" is only for an
+/// install whose folder can no longer be read back.
+fn files_kept_row(folder: Option<&Path>) -> (String, String) {
+    let text = match folder {
+        Some(f) => format!("still in {}", f.display()),
+        None => "were not touched".to_owned(),
+    };
+    ("Your files".to_owned(), text)
+}
+
 /// `hopsync uninstall`. Removes the service and binary. The data stays unless `purge` is set, and
 /// the files folder always stays: those are the user's files.
 pub fn run_uninstall(purge: bool, yes: bool, plain: bool) -> Fallible<()> {
@@ -1509,6 +1519,19 @@ pub fn run_uninstall(purge: bool, yes: bool, plain: bool) -> Fallible<()> {
     let data_dir = match mode {
         Mode::System => PathBuf::from(SYSTEM_HOME),
         _ => user_data_dir()?,
+    };
+    // Read now: the unit and the state file are gone by the time the panel is printed.
+    let folder = match mode {
+        Mode::System => std::fs::read_to_string(SYSTEM_UNIT)
+            .ok()
+            .and_then(|u| parse_unit(&u))
+            .map(|(f, _)| f),
+        Mode::User => user_unit_path()
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|u| parse_unit(&u))
+            .map(|(f, _)| f),
+        Mode::Background => read_state(&data_dir).map(|s| s.folder),
     };
     if !yes {
         let what = if purge {
@@ -1584,10 +1607,7 @@ pub fn run_uninstall(purge: bool, yes: bool, plain: bool) -> Fallible<()> {
         if mode == Mode::System {
             let _ = run("userdel", &[SERVICE_USER]);
         }
-        ui.panel(
-            "Hopsync is removed",
-            &[("Your files".to_owned(), "were not touched".to_owned())],
-        );
+        ui.panel("Hopsync is removed", &[files_kept_row(folder.as_deref())]);
     } else {
         ui.panel(
             "Hopsync is removed",
@@ -1600,7 +1620,7 @@ pub fn run_uninstall(purge: bool, yes: bool, plain: bool) -> Fallible<()> {
                     "Delete them too".to_owned(),
                     format!("rm -rf {}", data_dir.display()),
                 ),
-                ("Your files".to_owned(), "were not touched".to_owned()),
+                files_kept_row(folder.as_deref()),
             ],
         );
     }
@@ -1870,6 +1890,18 @@ mod tests {
         let user = render_user_unit(&spec("/home/a/b")).unwrap();
         assert_eq!(parse_unit(&user), Some((PathBuf::from("/home/a/b"), 8123)));
         assert_eq!(parse_unit("[Service]\nExecStart=/bin/true\n"), None);
+    }
+
+    #[test]
+    fn uninstall_says_where_the_files_stayed() {
+        assert_eq!(
+            files_kept_row(Some(Path::new("/srv/hopsync"))),
+            ("Your files".to_owned(), "still in /srv/hopsync".to_owned())
+        );
+        assert_eq!(
+            files_kept_row(None),
+            ("Your files".to_owned(), "were not touched".to_owned())
+        );
     }
 
     #[test]
