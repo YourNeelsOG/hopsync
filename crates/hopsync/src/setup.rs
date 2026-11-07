@@ -1203,7 +1203,7 @@ fn setup_system(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
     )?;
     let new_binary = ui.step("Installing the binary", || {
         install_binary(Path::new(SYSTEM_BIN))
-    })?;
+    })? || daemon_is_outdated(service_pid(Mode::System));
     let changed = ui.step("Writing the system service", || -> Fallible<bool> {
         let changed = write_unit(unit, &rendered)?;
         if changed {
@@ -1327,7 +1327,8 @@ fn setup_user(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
             folder: chosen,
         },
     )?;
-    let new_binary = ui.step("Installing the binary", || install_binary(&exec))?;
+    let new_binary = ui.step("Installing the binary", || install_binary(&exec))?
+        || daemon_is_outdated(service_pid(Mode::User));
     let changed = ui.step("Writing the user service", || -> Fallible<bool> {
         let changed = write_unit(&unit, &rendered)?;
         if changed {
@@ -1366,6 +1367,28 @@ fn setup_user(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
         full_access,
         setup_required,
     })
+}
+
+/// Whether a process's `/proc/<pid>/exe` link says its binary has since been replaced on disk.
+pub fn binary_was_replaced(exe: &Path) -> bool {
+    exe.to_string_lossy().ends_with(" (deleted)")
+}
+
+/// Whether a running daemon is an older binary. The install script replaces the file before setup
+/// runs, so setup finds nothing new to install, and only the running process shows the difference.
+fn daemon_is_outdated(pid: Option<i32>) -> bool {
+    pid.and_then(|p| std::fs::read_link(format!("/proc/{p}/exe")).ok())
+        .is_some_and(|exe| binary_was_replaced(&exe))
+}
+
+/// The main process of a service, from systemd.
+fn service_pid(mode: Mode) -> Option<i32> {
+    systemctl(mode, &["show", "--property=MainPID", "--value", "hopsync"])
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|p| *p > 0)
 }
 
 /// Where a non-root install keeps the binary: where it is if that is a system folder, else ~/.local.
@@ -1567,7 +1590,8 @@ fn setup_background(ui: &Ui, o: &SetupOptions) -> Fallible<Started> {
             folder: folder.clone(),
         },
     )?;
-    let new_binary = ui.step("Installing the binary", || install_binary(&exec))?;
+    let new_binary = ui.step("Installing the binary", || install_binary(&exec))?
+        || daemon_is_outdated(running_pid(&data_dir));
     let state = BackgroundState {
         exec: exec.clone(),
         folder: folder.clone(),
@@ -2215,6 +2239,15 @@ mod tests {
                 .unwrap_err()
                 .contains("--full-access")
         );
+    }
+
+    #[test]
+    fn a_daemon_whose_binary_was_replaced_is_out_of_date() {
+        let current = Path::new("/usr/local/bin/hopsync");
+        assert!(!binary_was_replaced(current));
+        assert!(binary_was_replaced(Path::new(
+            "/usr/local/bin/hopsync (deleted)"
+        )));
     }
 
     #[test]

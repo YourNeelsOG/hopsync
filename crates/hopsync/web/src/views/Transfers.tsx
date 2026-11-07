@@ -223,7 +223,7 @@ function Pane({
   const sendFiles = async (files: File[]) => {
     for (const file of files) {
       const dest = joinPath(path, file.name);
-      const progress = (done: number) => setUploading(`${file.name}: ${Math.floor((done / Math.max(file.size, 1)) * 100)}%`);
+      const progress = (done: number) => setUploading(`${Math.floor((done / Math.max(file.size, 1)) * 100)}% ${file.name}`);
       try {
         try {
           await uploadFile(dest, file, false, progress);
@@ -269,7 +269,7 @@ function Pane({
             <strong className="flex-1">No server</strong>
           )
         ) : (
-          <strong className="flex-1 px-1">{title}</strong>
+          <strong className="flex-1 px-1 whitespace-nowrap">{title}</strong>
         )}
         <span className="min-w-0 truncate text-xs whitespace-nowrap text-muted tabular-nums">{uploading || (selected.size ? `${selected.size} selected` : "")}</span>
         {browserFiles && (
