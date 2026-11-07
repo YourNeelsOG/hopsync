@@ -2164,7 +2164,8 @@ mod tests {
         s.full_access = true;
         let u = render_full_system_unit(&s).unwrap();
         assert!(u.starts_with(MARKER));
-        assert!(!u.contains("\nUser="), "{u}");
+        // systemd sets HOME only when User= is named, and the daemon cannot start without it.
+        assert!(u.contains("\nUser=root\n"), "{u}");
         assert!(u.contains("--listen 127.0.0.1:8123"), "{u}");
         assert!(u.contains("--root / --full-access"), "{u}");
         assert!(unit_has_full_access(&u));

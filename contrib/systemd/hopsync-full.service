@@ -10,6 +10,9 @@ Wants=network-online.target
 
 [Service]
 Type=exec
+# Named so that systemd sets HOME, which the daemon needs.
+User=root
+Group=root
 ExecStart=/usr/local/bin/hopsync serve --listen 127.0.0.1:7890 --data-dir /var/lib/hopsync/data --root / --full-access --socket /run/hopsync/hopsync.sock
 Restart=on-failure
 RestartSec=5s
