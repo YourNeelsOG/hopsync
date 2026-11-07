@@ -1,10 +1,10 @@
 // The main page: two panes, the transfer buttons between them, and the queue below.
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChevronUp, File as FileIcon, FileQuestion, Folder, GitCompareArrows, Link2, RefreshCw } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChevronUp, Download, File as FileIcon, FileQuestion, Folder, GitCompareArrows, Link2, RefreshCw, Upload } from "lucide-react";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRowHeight, VirtualRows } from "../components/ui";
-import { api, ApiError, type Direction, type Entry, type EntryKind, type JobSpec, type Server } from "../lib/api";
+import { api, ApiError, uploadFile, type Direction, type Entry, type EntryKind, type JobSpec, type Server } from "../lib/api";
 import { compareMark, indexByName, type Mark, sortEntries } from "../lib/files";
 import { bytes, joinPath, parentPath, shortStamp, stamp } from "../lib/format";
 import { useServers } from "../lib/hooks";
@@ -216,6 +216,42 @@ function Pane({
 
   const parts = path ? path.split("/") : [];
   const canList = servers === undefined || pane.server !== null;
+  const browserFiles = !servers;
+  const [uploading, setUploading] = useState("");
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  const sendFiles = async (files: File[]) => {
+    for (const file of files) {
+      const dest = joinPath(path, file.name);
+      const progress = (done: number) => setUploading(`${file.name}: ${Math.floor((done / Math.max(file.size, 1)) * 100)}%`);
+      try {
+        try {
+          await uploadFile(dest, file, false, progress);
+        } catch (e) {
+          if (!(e instanceof ApiError && e.status === 409 && e.message.includes("already exists"))) throw e;
+          if (!window.confirm(`${file.name} is already in this folder. Replace it?`)) continue;
+          await uploadFile(dest, file, true, progress);
+        }
+        toast(`Uploaded ${file.name}.`, "ok");
+      } catch (e) {
+        toast(`${file.name}: ${e instanceof Error ? e.message : "upload failed"}`);
+      }
+      pane.refresh();
+    }
+    setUploading("");
+  };
+
+  const saveSelected = () => {
+    const chosen = sorted.filter((e) => selected.has(e.name));
+    const files = chosen.filter((e) => e.kind === "file");
+    if (files.length < chosen.length) toast("Only files can be saved to this computer, not folders.");
+    for (const e of files) {
+      const a = document.createElement("a");
+      a.href = `/api/local/file?path=${encodeURIComponent(joinPath(path, e.name))}`;
+      a.download = e.name;
+      a.click();
+    }
+  };
 
   return (
     <div id={`pane-${side}`} className="file-pane card flex min-h-[320px] min-w-0 flex-col overflow-hidden lg:min-h-0" aria-label={title} role="region">
@@ -235,7 +271,29 @@ function Pane({
         ) : (
           <strong className="flex-1 px-1">{title}</strong>
         )}
-        <span className="text-xs whitespace-nowrap text-muted tabular-nums">{selected.size ? `${selected.size} selected` : ""}</span>
+        <span className="min-w-0 truncate text-xs whitespace-nowrap text-muted tabular-nums">{uploading || (selected.size ? `${selected.size} selected` : "")}</span>
+        {browserFiles && (
+          <>
+            <input
+              ref={fileInput}
+              type="file"
+              multiple
+              hidden
+              aria-label="Files to upload"
+              onChange={(ev) => {
+                const files = [...(ev.target.files ?? [])];
+                ev.target.value = "";
+                void sendFiles(files);
+              }}
+            />
+            <button type="button" className="btn btn-ghost btn-icon" aria-label="Upload from this computer" title="Upload from this computer" disabled={uploading !== ""} onClick={() => fileInput.current?.click()}>
+              <Upload aria-hidden className="size-3.5" />
+            </button>
+            <button type="button" className="btn btn-ghost btn-icon" aria-label="Save to this computer" title="Save to this computer" disabled={selected.size === 0} onClick={saveSelected}>
+              <Download aria-hidden className="size-3.5" />
+            </button>
+          </>
+        )}
         <button type="button" className="btn btn-ghost btn-icon" aria-label="Up one folder" title="Up one folder" disabled={!path} onClick={() => setPath(parentPath(path))}>
           <ChevronUp aria-hidden className="size-4" />
         </button>

@@ -101,6 +101,11 @@ hopsync setup --full-access
 > overwrite system files, and files Hopsync writes belong to root. Use a long password, and prefer
 > `--local-only` with an SSH tunnel if you can.
 
+### Upload and download from your computer
+
+In the **This box** panel, the upload button sends files from your computer to the open folder, and the
+download button saves the ticked files to your computer. Folders can't be saved this way yet.
+
 ### Settings file
 
 The same choice is in a file you can edit:

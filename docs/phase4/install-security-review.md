@@ -104,3 +104,10 @@ Accepted risks of public mode:
   mode off or read the vault. A file such as `~/bin/x` that the shell runs can still be overwritten.
 - **The settings file is trusted as much as the unit.** It is root-owned with mode 0600 on a root box,
   and its folder goes through the same checks as a typed answer.
+- **Browser file routes follow the same rules as the rest of the API.** `GET` and `PUT /api/local/file`
+  need a session, `PUT` needs the same origin and `application/octet-stream`, which a cross-site form
+  cannot send without a preflight, and only this route accepts that type. Paths pass through `LocalRoot`,
+  so roots, symlinks and hidden entries apply. Downloads are `attachment` with `nosniff`, and the name is
+  percent-encoded, so a hostile file name cannot add a header or run as a page. Both are in the audit log.
+- **A password typed in Add server is sent only after the host key is trusted**, in the one login call,
+  and is never stored or logged.

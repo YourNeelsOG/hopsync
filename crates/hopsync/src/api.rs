@@ -5,7 +5,8 @@
 //!   in `daemon`).
 //! - CSRF: every state-changing request from the network must pass `auth::same_origin`, and POST
 //!   and PUT bodies must be `application/json` (an HTML form cannot send that cross-site without
-//!   a CORS preflight, which this server never approves).
+//!   a CORS preflight, which this server never approves). A file upload is
+//!   `application/octet-stream`, which needs that preflight just the same.
 //! - On a loopback listener, the `Host` header must name a loopback host (DNS rebinding).
 //! - Every response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and
 //!   a CSP that allows nothing but this origin. All but hashed UI files carry `Cache-Control:
@@ -156,6 +157,7 @@ pub fn router(svc: Arc<Service>, transport: Transport) -> Router {
         .route("/api/servers/{id}/install-key", post(install_key))
         .route("/api/servers/{id}/list", get(list_remote))
         .route("/api/local/list", get(list_local))
+        .route("/api/local/file", get(download_file).put(upload_file))
         .route("/api/jobs", get(list_jobs).post(add_job))
         .route("/api/jobs/dry-run", post(dry_run))
         .route("/api/jobs/{id}", get(get_job).delete(delete_job))
@@ -246,16 +248,18 @@ async fn csrf(Extension(t): Extension<Transport>, req: Request, next: Next) -> A
         ) {
             return Err(err(StatusCode::FORBIDDEN, "cross-origin request refused"));
         }
+        let wanted = if *req.method() == Method::PUT && req.uri().path() == "/api/local/file" {
+            "application/octet-stream"
+        } else {
+            "application/json"
+        };
         if matches!(*req.method(), Method::POST | Method::PUT)
-            && !header_str(h, header::CONTENT_TYPE).is_some_and(|c| {
-                c.split(';')
-                    .next()
-                    .is_some_and(|m| m.trim() == "application/json")
-            })
+            && !header_str(h, header::CONTENT_TYPE)
+                .is_some_and(|c| c.split(';').next().is_some_and(|m| m.trim() == wanted))
         {
             return Err(err(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "the body must be application/json",
+                format!("the body must be {wanted}"),
             ));
         }
     }
@@ -494,6 +498,91 @@ async fn list_remote(
 
 async fn list_local(State(st): State<AppState>, Query(q): Query<PathQuery>) -> ApiResult<Response> {
     Ok(Json(st.svc.list_local(&q.path).await?).into_response())
+}
+
+/// How much of a file a download holds in memory, per download.
+const DOWNLOAD_PIECE: usize = 1 << 20;
+
+/// `filename*` of a `Content-Disposition`: everything but plain characters is percent-encoded,
+/// so no name can add a header or break out of the value.
+fn disposition(name: &str) -> String {
+    let mut out = String::from("attachment; filename*=UTF-8''");
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+async fn download_file(
+    State(st): State<AppState>,
+    Query(q): Query<PathQuery>,
+) -> ApiResult<Response> {
+    let d = st.svc.open_download(&q.path).await?;
+    let (size, name) = (d.size, d.name);
+    let reader = Arc::new(d.reader);
+    // Reads the next piece only when the connection has taken the last one, and stops at the size
+    // it announced if the file grows meanwhile.
+    let pieces = futures_util::stream::unfold((reader, 0u64), move |(reader, offset)| async move {
+        if offset >= size {
+            return None;
+        }
+        let want = usize::try_from((size - offset).min(DOWNLOAD_PIECE as u64)).ok()?;
+        let r = reader.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0u8; want];
+            r.read_at(offset, &mut buf).map(|n| {
+                buf.truncate(n);
+                buf
+            })
+        })
+        .await;
+        match read {
+            Ok(Ok(buf)) if !buf.is_empty() => {
+                let next = offset + buf.len() as u64;
+                Some((Ok(axum::body::Bytes::from(buf)), (reader, next)))
+            }
+            // A file that shrank: the short body tells the browser it did not finish.
+            Ok(Ok(_)) => None,
+            Ok(Err(e)) => Some((Err(e), (reader, size))),
+            Err(e) => Some((Err(std::io::Error::other(e)), (reader, size))),
+        }
+    });
+    let mut r = axum::body::Body::from_stream(pieces).into_response();
+    let h = r.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
+    if let Ok(v) = HeaderValue::from_str(&disposition(&name)) {
+        h.insert(header::CONTENT_DISPOSITION, v);
+    }
+    Ok(r)
+}
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    path: String,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+async fn upload_file(
+    State(st): State<AppState>,
+    Query(q): Query<UploadQuery>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> ApiResult<Response> {
+    let declared = header_str(&headers, header::CONTENT_LENGTH).and_then(|v| v.parse().ok());
+    let bytes = st
+        .svc
+        .upload_local(&q.path, q.overwrite, declared, body.into_data_stream())
+        .await?;
+    Ok(Json(json!({ "bytes": bytes })).into_response())
 }
 
 // Jobs.

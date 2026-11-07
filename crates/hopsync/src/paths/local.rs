@@ -316,6 +316,21 @@ impl LocalRoot {
         }
     }
 
+    /// Removes the file `rel`. A missing file is not an error.
+    pub fn remove_file(&self, rel: &RelPath) -> io::Result<()> {
+        let Some(name) = rel.components().last() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot remove the root",
+            ));
+        };
+        let parent = self.open_parent(rel, dir_flags())?;
+        match rustix::fs::unlinkat(&parent, name.as_str(), AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Opens the directory containing `rel` (the root for a single component).
     fn open_parent(&self, rel: &RelPath, oflags: OFlags) -> io::Result<OwnedFd> {
         self.reachable(rel)?;

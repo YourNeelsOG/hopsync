@@ -852,6 +852,8 @@ fn summary(ui: &Ui, mode: Mode, s: &Started) {
     }
     if let Ok(path) = settings_path(mode) {
         rows.push(("Settings file".to_owned(), path.display().to_string()));
+        // `systemctl restart` alone keeps the old unit, which decides the account and the access.
+        rows.push(("Apply a change".to_owned(), "hopsync restart".to_owned()));
     }
     rows.extend(
         command_rows(mode)
