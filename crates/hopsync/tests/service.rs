@@ -643,6 +643,45 @@ async fn browser_transfers_to_a_server_stay_in_its_root_folder() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn browser_transfers_do_not_pass_through_a_symlink_on_the_server() {
+    let Some(e) = env() else { return };
+    let svc = e.open();
+    let id = trusted(&svc, &e, "a").await;
+    let outside = e.sshd.dir().join("outside-dir");
+    std::fs::create_dir(&outside).expect("mkdir");
+    std::fs::write(outside.join("secret"), b"secret").expect("write");
+    std::os::unix::fs::symlink(&outside, e.remote_dir().join("link")).expect("symlink");
+
+    assert!(matches!(
+        svc.open_remote_download(id, "link/secret").await,
+        Err(ServiceError::BadRequest(_))
+    ));
+    assert!(matches!(
+        svc.upload_remote(id, "link/new", false, Some(1), browser_body(b"x"))
+            .await,
+        Err(ServiceError::BadRequest(_))
+    ));
+    assert!(!outside.join("new").exists());
+    assert!(!outside.join("new.hopsync-upload").exists());
+
+    // A link planted at the part file's name must not be written through.
+    let victim = outside.join("victim");
+    std::fs::write(&victim, b"keep me").expect("write");
+    std::os::unix::fs::symlink(&victim, e.remote_dir().join("up.bin.hopsync-upload"))
+        .expect("symlink");
+    assert!(matches!(
+        svc.upload_remote(id, "up.bin", false, Some(1), browser_body(b"x"))
+            .await,
+        Err(ServiceError::Conflict(_))
+    ));
+    assert_eq!(std::fs::read(&victim).expect("read"), b"keep me");
+    assert!(
+        e.remote_dir().join("up.bin.hopsync-upload").is_symlink(),
+        "a part file this upload did not make stays where it was"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_cut_upload_to_a_server_leaves_nothing_behind() {
     let Some(e) = env() else { return };
     let svc = e.open();

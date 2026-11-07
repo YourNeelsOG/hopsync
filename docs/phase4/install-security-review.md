@@ -108,7 +108,8 @@ Accepted risks of public mode:
   `/api/local/file` and `/api/servers/{id}/file` need a session, `PUT` needs the same origin and `application/octet-stream`, which a cross-site form
   cannot send without a preflight, and only these routes accept that type. Local paths pass through
   `LocalRoot`, so roots, symlinks and hidden entries apply. Server paths stay under that server's root
-  folder, a blocked host key refuses them, and a symlink there is not followed on download. Downloads are `attachment` with `nosniff`, and the name is
+  folder, a blocked host key refuses them, and neither a symlink at the path, in a parent folder, nor at
+  the part file's name is followed. Downloads are `attachment` with `nosniff`, and the name is
   percent-encoded, so a hostile file name cannot add a header or run as a page. Both are in the audit log.
 - **A password typed in Add server is sent only after the host key is trusted**, in the one login call,
   and is never stored or logged.

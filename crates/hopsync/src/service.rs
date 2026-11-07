@@ -194,6 +194,29 @@ fn remote_path(s: &Server, rel: &RelPath) -> Result<String> {
         .join(rel))
 }
 
+/// Refuses a path whose parent folders include a symlink, which could lead out of the server's
+/// root folder. SFTP has no way to open a path "beneath" a folder, so each one is checked. A
+/// missing folder ends the walk: the open or the rename that follows reports it.
+async fn refuse_links_on_the_way(
+    sftp: &crate::sftp::Sftp,
+    s: &Server,
+    rel: &RelPath,
+) -> Result<()> {
+    let names: Vec<&str> = rel.components().iter().map(Name::as_str).collect();
+    for end in 1..names.len() {
+        let folder = remote_path(s, &parse_rel(&names[..end].join("/"))?)?;
+        match sftp.lstat(&folder).await {
+            Ok(a) if a.kind == RemoteKind::Symlink => {
+                return Err(bad(format!("{} is a symlink", names[..end].join("/"))));
+            }
+            Ok(_) => {}
+            Err(SftpError::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(sftp_error(e)),
+        }
+    }
+    Ok(())
+}
+
 /// A server's refusal, in the terms the API answers with.
 fn sftp_error(e: SftpError) -> ServiceError {
     match e {
@@ -1168,6 +1191,7 @@ impl Service {
         let s = self.store.server(server)?;
         let full = remote_path(&s, &rel)?;
         let sftp = self.remote(&s)?.session(&self.base_opts()).await?;
+        refuse_links_on_the_way(&sftp, &s, &rel).await?;
         let attrs = sftp.lstat(&full).await.map_err(sftp_error)?;
         // A symlink could lead out of the server's root folder.
         if attrs.kind != RemoteKind::File {
@@ -1225,6 +1249,17 @@ impl Service {
             cleanup: None,
         };
         let sftp = self.remote(&s)?.session(&self.base_opts()).await?;
+        refuse_links_on_the_way(&sftp, &s, &rel).await?;
+        // Opening follows a symlink, so one planted at this name would be written through.
+        match sftp.lstat(&part).await {
+            Ok(a) if a.kind != RemoteKind::File => {
+                return Err(ServiceError::Conflict(format!(
+                    "{name}.hopsync-upload is in the way and is not a file"
+                )));
+            }
+            Ok(_) | Err(SftpError::NotFound(_)) => {}
+            Err(e) => return Err(sftp_error(e)),
+        }
         match sftp.lstat(&full).await {
             Ok(a) if a.kind == RemoteKind::Dir => {
                 return Err(ServiceError::Conflict("a folder has that name".into()));
@@ -1296,12 +1331,9 @@ impl Service {
         // Not every server offers fsync; the file is still complete when it does not.
         let _ = file.fsync().await;
         file.close().await.map_err(sftp_error)?;
-        if overwrite {
-            sftp.rename(&part, &full, true).await
-        } else {
-            sftp.rename(&part, &full, false).await
-        }
-        .map_err(sftp_error)?;
+        sftp.rename(&part, &full, overwrite)
+            .await
+            .map_err(sftp_error)?;
         guard.cleanup = None;
         self.store.audit("upload", &format!("{}:{path}", s.name))?;
         Ok(total)
