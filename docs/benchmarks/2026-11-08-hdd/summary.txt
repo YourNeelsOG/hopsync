@@ -1,0 +1,5 @@
+rclone-before rc=0 secs=534.1 avg_MiBs=61.4
+hopsync-before rc=0 secs=902.4 avg_MiBs=36.3
+ALLDONE
+pipe16m rc=0 secs=265.9 avg_MiBs=123.2
+PIPEDONE

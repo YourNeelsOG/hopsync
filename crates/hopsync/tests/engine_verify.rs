@@ -67,6 +67,8 @@ impl Env {
                 min_chunk: CHUNK as u64,
                 max_chunk: CHUNK as u64,
             },
+            // Each chunk its own checkpoint, so an interrupted run leaves chunks to resume.
+            checkpoint: CHUNK as u64,
             journal: Some(self.journal.clone()),
             verify,
             ..TransferOptions::default()

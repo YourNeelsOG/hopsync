@@ -22,6 +22,47 @@ const TABS: { id: string; label: string; empty: string; pick: (j: Job) => boolea
 const formatBytes = (n: number) => bytes(Math.round(n));
 const formatRate = (n: number) => (n >= 1 ? `${bytes(Math.round(n))}/s` : "starting");
 
+const percent = (share: number) => `${Math.floor(share * 100)}%`;
+
+/** A thin bar for one file in flight, labelled with its path. */
+function FileBar({ path, done, size }: { path: string; done: number; size: number }) {
+  const share = size ? Math.min(done / size, 1) : 1;
+  return (
+    <div className="flex min-w-0 items-center gap-2 text-xs text-muted">
+      <span className="min-w-0 flex-1 truncate" title={path}>
+        {path}
+      </span>
+      <div
+        className="bar-track w-20 shrink-0"
+        role="progressbar"
+        aria-label={path}
+        aria-valuemin={0}
+        aria-valuemax={size}
+        aria-valuenow={Math.min(done, size)}
+      >
+        <div className="bar-fill" style={{ transform: `scaleX(${share})` }} />
+      </div>
+      <span className="w-9 shrink-0 text-right tabular-nums">{percent(share)}</span>
+    </div>
+  );
+}
+
+/** Done of total, with a percentage when the total is known. */
+function Amount({ done, total }: { done: number; total: number | null }) {
+  return (
+    <>
+      <span>
+        <AnimatedNumber value={done} format={formatBytes} />
+        {total ? ` of ${bytes(total)}` : ""}
+      </span>
+      {total ? <span className="font-medium text-text">{percent(Math.min(done / total, 1))}</span> : null}
+    </>
+  );
+}
+
+const filesText = (files: number, total: number | null) =>
+  total !== null ? `${files} of ${total} files` : `${files} file${files === 1 ? "" : "s"}`;
+
 /** Live numbers for one running job. */
 export function JobLive({ id }: { id: number }) {
   const p = useLive((s) => s.progressOf(id));
@@ -33,8 +74,8 @@ export function JobLive({ id }: { id: number }) {
       </div>
     );
   }
-  const share = p.total ? Math.min(p.bytes / p.total, 1) : null;
-  const eta = p.total && p.rate ? duration((p.total - p.bytes) / p.rate) : "";
+  const share = p.total ? Math.min(p.done / p.total, 1) : null;
+  const eta = p.eta !== null ? duration(p.eta) : "";
   return (
     <div className="flex min-w-0 flex-col gap-1">
       <div
@@ -43,7 +84,7 @@ export function JobLive({ id }: { id: number }) {
         aria-label="Progress"
         aria-valuemin={0}
         aria-valuemax={p.total ?? undefined}
-        aria-valuenow={p.total ? Math.min(p.bytes, p.total) : undefined}
+        aria-valuenow={p.total ? Math.min(p.done, p.total) : undefined}
       >
         {share === null ? <div className="bar-fill bar-unknown" /> : <div className="bar-fill" style={{ transform: `scaleX(${share})` }} />}
       </div>
@@ -51,16 +92,44 @@ export function JobLive({ id }: { id: number }) {
         <span data-testid="job-rate" className="font-mono font-medium text-text">
           <AnimatedNumber value={p.rate} format={formatRate} />
         </span>
-        <span>
-          <AnimatedNumber value={p.bytes} format={formatBytes} />
-          {p.total ? ` of ${bytes(p.total)}` : ""}
-        </span>
+        <Amount done={p.done} total={p.total} />
         {eta && <span>{eta} left</span>}
-        <span>
-          {p.files} file{p.files === 1 ? "" : "s"}
-        </span>
+        <span>{filesText(p.files, p.total_files)}</span>
         {p.problems > 0 && <span>{p.problems} skipped or failed</span>}
+        {p.total === null && <span>counting</span>}
       </div>
+      {p.active.length > 0 && (
+        <div className="flex flex-col gap-0.5 pt-0.5">
+          {p.active.map((f) => (
+            <FileBar key={f.path} {...f} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** One line for every running job together: bytes and files of the totals, speed, time left. */
+export function QueueTotals() {
+  const snap = useLive((s) => s.snapshot());
+  const running = snap.running;
+  if (running.length === 0) return null;
+  const known = running.every((p) => p.total !== null);
+  const done = running.reduce((n, p) => n + p.done, 0);
+  const total = known ? running.reduce((n, p) => n + (p.total ?? 0), 0) : null;
+  const files = running.reduce((n, p) => n + p.files, 0);
+  const totalFiles = running.every((p) => p.total_files !== null) ? running.reduce((n, p) => n + (p.total_files ?? 0), 0) : null;
+  const speed = running.reduce((n, p) => n + p.rate, 0);
+  // Jobs run side by side, so all are done when the slowest is.
+  const etas = running.map((p) => p.eta);
+  const eta = known && etas.every((e) => e !== null) ? duration(Math.max(...etas.map((e) => e ?? 0))) : "";
+  return (
+    <div data-testid="queue-totals" className="flex flex-wrap items-baseline gap-x-2 border-b border-line px-3 py-1.5 text-xs text-muted tabular-nums">
+      <span className="font-medium text-text">All running</span>
+      <span className="font-mono">{formatRate(speed)}</span>
+      <Amount done={done} total={total} />
+      {eta && <span>{eta} left</span>}
+      <span>{filesText(files, totalFiles)}</span>
     </div>
   );
 }
@@ -164,6 +233,7 @@ export function Queue({ tab, onTab, servers }: { tab: string; onTab: (t: string)
         )}
       </div>
       <Tabs.Content value={current.id} tabIndex={-1} className="scroller min-h-0 flex-1">
+        {current.id === "active" && <QueueTotals />}
         {shown.length === 0 && <p className="p-3 text-muted">{current.empty}</p>}
         <AnimatePresence initial={false}>
           {shown.map((j, i) => (

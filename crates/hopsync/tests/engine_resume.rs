@@ -54,7 +54,7 @@ impl Env {
     fn local_path(&self, name: &str) -> PathBuf {
         self.local_dir.path().join(name)
     }
-    /// 8 chunks of 8 MiB over 2 lanes, journaled.
+    /// 8 chunks of 8 MiB over 2 lanes, journaled, each chunk its own durability checkpoint.
     fn opts(&self) -> TransferOptions {
         TransferOptions {
             lanes: 2,
@@ -63,6 +63,7 @@ impl Env {
                 min_chunk: 8 << 20,
                 max_chunk: 8 << 20,
             },
+            checkpoint: 8 << 20,
             journal: Some(self.journal.clone()),
             ..TransferOptions::default()
         }
@@ -209,4 +210,82 @@ async fn lost_part_file_is_not_trusted() {
         "a journal without its part file must start over"
     );
     assert_eq!(std::fs::read(e.local_path("f")).expect("read"), data);
+}
+
+/// Chunks are made durable in batches of `checkpoint` bytes, not one fsync each: with the default
+/// (1 GiB), nothing of a 64 MiB file is recorded before it finishes, so an interrupted run resumes
+/// nothing (and paid no fsync on the way).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chunks_are_recorded_in_checkpoint_batches() {
+    let Some(e) = env() else { return };
+    let data = write_source(&e.local_path("f"), 4, 1_600_000_000);
+    let base = TransferOptions {
+        checkpoint: TransferOptions::default().checkpoint,
+        ..e.opts()
+    };
+    assert_eq!(base.checkpoint, 1 << 30, "default checkpoint");
+    interrupted(0.9, |o| {
+        let (e, o) = (&e, with_journal(base.clone(), o));
+        async move { push_file(&e.local, &rel("f"), &e.remote, &rel("f"), &o).await }
+    })
+    .await;
+    let report = push_file(&e.local, &rel("f"), &e.remote, &rel("f"), &base)
+        .await
+        .expect("second push");
+    assert_eq!(report.resumed, 0, "no batch reached the checkpoint");
+    assert_eq!(std::fs::read(e.remote_path("f")).expect("read"), data);
+
+    // Two chunks per checkpoint: what is resumed is whole batches of 16 MiB.
+    let two = TransferOptions {
+        checkpoint: 16 << 20,
+        ..e.opts()
+    };
+    let data = write_source(&e.local_path("g"), 5, 1_600_000_000);
+    interrupted(0.9, |o| {
+        let (e, o) = (&e, with_journal(two.clone(), o));
+        async move { push_file(&e.local, &rel("g"), &e.remote, &rel("g"), &o).await }
+    })
+    .await;
+    let report = push_file(&e.local, &rel("g"), &e.remote, &rel("g"), &two)
+        .await
+        .expect("second push");
+    assert!(
+        report.resumed >= 16 << 20,
+        "resumed {} bytes",
+        report.resumed
+    );
+    assert_eq!(std::fs::read(e.remote_path("g")).expect("read"), data);
+}
+
+/// Whether this filesystem allocates space on request (tmpfs, ext4, xfs and btrfs do).
+fn can_preallocate(dir: &Path) -> bool {
+    let probe = dir.join("probe");
+    let f = std::fs::File::create(&probe).expect("probe");
+    let ok = rustix::fs::fallocate(&f, rustix::fs::FallocateFlags::KEEP_SIZE, 0, 1 << 20).is_ok();
+    let _ = std::fs::remove_file(probe);
+    ok
+}
+
+/// A pull reserves the whole file before writing, so a hard drive lays it out in few extents
+/// whatever order the chunks land in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pull_preallocates_its_part_file() {
+    use std::os::unix::fs::MetadataExt;
+    let Some(e) = env() else { return };
+    if !can_preallocate(e.local_dir.path()) {
+        eprintln!("skipping: no fallocate on this filesystem");
+        return;
+    }
+    write_source(&e.remote_path("f"), 6, 1_600_000_000);
+    interrupted(0.25, |o| {
+        let (e, o) = (&e, with_journal(e.opts(), o));
+        async move { pull_file(&e.remote, &rel("f"), &e.local, &rel("f"), &o).await }
+    })
+    .await;
+    let m = std::fs::metadata(e.local_path("f.hopsync-part")).expect("part");
+    assert!(
+        m.blocks() * 512 >= SIZE as u64,
+        "{} bytes allocated of {SIZE}",
+        m.blocks() * 512
+    );
 }

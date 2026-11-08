@@ -47,6 +47,17 @@ impl LocalReader {
         Ok(self.file.metadata()?.len())
     }
 
+    /// The device the file lives on (`st_dev`).
+    pub fn device(&self) -> io::Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(self.file.metadata()?.dev())
+    }
+
+    /// Tells the kernel the file is read front to back, so it reads further ahead. Advisory.
+    pub fn advise_sequential(&self) {
+        let _ = fadvise(self.file.as_fd(), 0, None, Advice::Sequential);
+    }
+
     /// Fills `buf` from `offset` unless the file ends first. Returns bytes read; 0 at or past the end.
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         let mut done = 0;
@@ -81,6 +92,16 @@ pub struct LocalWriter {
 }
 
 impl LocalWriter {
+    /// Reserves `len` bytes for the file without changing its size, so a hard drive can lay it out
+    /// in few extents however the chunks arrive. Advisory: a filesystem without `fallocate` (or
+    /// one that is full) is left to fail, or not, on the writes themselves.
+    pub fn preallocate(&self, len: u64) {
+        if len > 0 {
+            let _ =
+                rustix::fs::fallocate(&*self.file, rustix::fs::FallocateFlags::KEEP_SIZE, 0, len);
+        }
+    }
+
     pub fn new(file: File, cache: CachePolicy) -> Self {
         Self {
             file: Arc::new(file),

@@ -1,0 +1,4 @@
+pipe-final rc=0 secs=264.8 avg_MiBs=123.7
+rclone-final rc=0 secs=551.0 avg_MiBs=59.5
+hopsync-final rc=0 secs=211.4 avg_MiBs=155.0
+hopsync-before2 rc=0 secs=929.6 avg_MiBs=35.2
