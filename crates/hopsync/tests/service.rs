@@ -29,16 +29,32 @@ fn env() -> Option<Env> {
     })
 }
 
+/// Opens a data folder that a dropped service used. A real restart ends the process, which frees the
+/// lock at once. In a test the lock can outlive the drop for a moment: a background task may hold the
+/// last reference, and a process another test is forking holds a copy of the descriptor until it
+/// execs. So a refusal is retried briefly. A lock that is never freed still fails.
+fn open_once_free(config: impl Fn() -> ServiceConfig) -> Arc<Service> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match Service::open(config()) {
+            Err(ServiceError::Conflict(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => break other.expect("open service"),
+        }
+    }
+}
+
 impl Env {
+    /// Opens the service, as a restart would.
     fn open(&self) -> Arc<Service> {
-        let svc = Service::open(ServiceConfig {
+        let svc = open_once_free(|| ServiceConfig {
             data_dir: self.data.path().join("data"),
             local_root: self.local.path().to_owned(),
             hidden: Default::default(),
             concurrency: 1,
             ssh: SshOptions::default(),
-        })
-        .expect("open service");
+        });
         svc.start();
         svc
     }
@@ -776,7 +792,7 @@ async fn a_second_daemon_on_the_same_data_dir_is_refused() {
         "the refused daemon touched nothing"
     );
     drop(first);
-    Service::open(config()).expect("open after the first one is gone");
+    open_once_free(config);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -822,4 +838,57 @@ async fn a_generated_key_is_installed_with_an_existing_login_once() {
         after,
         "installing twice adds nothing"
     );
+}
+
+/// A running tree job reports what it will send before its walk is done: files and bytes from a
+/// counting walk beside the transfer, bytes landed, and the files in flight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tree_job_reports_its_totals_while_running() {
+    let Some(e) = env() else { return };
+    let dir = e.local.path().join("tree");
+    std::fs::create_dir(&dir).expect("mkdir");
+    let (files, size) = (8u64, 64usize << 20);
+    for i in 0..files {
+        std::fs::write(dir.join(format!("f{i}")), vec![i as u8; size]).expect("write");
+    }
+    let svc = e.open();
+    let id = trusted(&svc, &e, "box").await;
+    let mut snaps = svc.subscribe();
+    let job = svc
+        .add_job(&JobSpec {
+            lanes: Some(1),
+            ..push(id, "tree", "tree")
+        })
+        .expect("queue");
+    let mut seen = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while seen.is_none() && tokio::time::Instant::now() < deadline {
+        if tokio::time::timeout(Duration::from_secs(1), snaps.changed())
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let snap = snaps.borrow_and_update().clone();
+        if let Some(p) = snap
+            .running
+            .iter()
+            .find(|p| p.job == job.id && p.total_files.is_some())
+        {
+            seen = Some(p.clone());
+        }
+        if svc.store.job(job.id).expect("job").state.is_final() {
+            break;
+        }
+    }
+    let p = seen.expect("a running snapshot with totals");
+    assert_eq!(p.total_files, Some(files));
+    assert_eq!(p.total, Some(files * size as u64));
+    assert!(p.done <= files * size as u64);
+    assert!(p.active.len() <= 16);
+    for f in &p.active {
+        assert!(f.done <= f.size && f.size == size as u64, "{f:?}");
+    }
+    let done = wait_for(&svc, job.id, |j| j.state.is_final()).await;
+    assert_eq!(done.state, JobState::Done, "{:?}", done.error);
 }

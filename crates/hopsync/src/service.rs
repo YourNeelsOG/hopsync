@@ -319,10 +319,52 @@ pub struct Progress {
     pub bytes: u64,
     pub files: u64,
     pub problems: u64,
-    /// Bytes per second, smoothed.
+    /// Bytes per second, smoothed over about two seconds.
     pub rate: u64,
-    /// Known for single files; a tree's size is only known after its walk.
+    /// Bytes this job will send, after the destination policy. Known at once for a single
+    /// file; for a tree, once a counting walk that runs beside the transfer finishes.
     pub total: Option<u64>,
+    /// Files this job will send, known with `total` for trees.
+    pub total_files: Option<u64>,
+    /// Bytes of the job's files that have landed: finished files plus active ones, resumed bytes
+    /// included and resent pieces not. Compare with `total` for a percentage.
+    pub done: u64,
+    /// Seconds left at the speed averaged over the last ten seconds or so. None in the first
+    /// seconds, while the total is unknown, or while nothing moves.
+    pub eta: Option<u64>,
+    /// Files in flight, by path, with bytes landed and size. At most `ACTIVE_SHOWN`.
+    pub active: Vec<FileProgress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileProgress {
+    pub path: String,
+    pub done: u64,
+    pub size: u64,
+}
+
+/// Active files listed per job in a snapshot.
+const ACTIVE_SHOWN: usize = 16;
+/// Time constant of the ETA's speed average.
+const ETA_SMOOTHING: Duration = Duration::from_secs(10);
+/// No ETA before this much transfer time: the first seconds are handshakes and ramp-up.
+const ETA_AFTER: Duration = Duration::from_secs(10);
+
+/// Exponential moving average over `dt`, with time constant `tau`; the first sample is taken as is.
+fn smooth(prev: f64, sample: f64, dt: Duration, tau: Duration) -> f64 {
+    if prev == 0.0 {
+        return sample;
+    }
+    let alpha = 1.0 - (-dt.as_secs_f64() / tau.as_secs_f64()).exp();
+    prev + (sample - prev) * alpha
+}
+
+/// Seconds left for `remaining` bytes at `rate` bytes per second.
+fn eta_secs(remaining: u64, rate: f64, elapsed: Duration) -> Option<u64> {
+    if elapsed < ETA_AFTER || rate < 1.0 {
+        return None;
+    }
+    Some((remaining as f64 / rate).ceil() as u64)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -339,6 +381,10 @@ struct Counters {
     bytes: AtomicU64,
     files: AtomicU64,
     problems: AtomicU64,
+    /// Sizes of the files finished so far.
+    finished_bytes: AtomicU64,
+    /// Files in flight: bytes landed and size, by path.
+    active: Mutex<HashMap<String, (u64, u64)>>,
 }
 
 struct Running {
@@ -347,9 +393,11 @@ struct Running {
     stop: Mutex<Option<JobState>>,
     counters: Arc<Counters>,
     direction: Direction,
-    total: Option<u64>,
-    /// Bytes and time at the last snapshot, and the smoothed rate.
-    last: Mutex<(u64, Instant, f64)>,
+    /// Files and bytes the job will send, once known.
+    totals: Mutex<(Option<u64>, Option<u64>)>,
+    started: Instant,
+    /// Bytes and time at the last snapshot, the two-second rate, and the ETA's slower rate.
+    last: Mutex<(u64, Instant, f64, f64)>,
 }
 
 pub struct Service {
@@ -628,17 +676,39 @@ impl Service {
             .map(|(&job, r)| {
                 let bytes = r.counters.bytes.load(Ordering::Relaxed);
                 let mut last = lock(&r.last);
-                let dt = now.duration_since(last.1).as_secs_f64();
-                if dt >= 0.2 {
-                    let instant = bytes.saturating_sub(last.0) as f64 / dt;
+                let dt = now.duration_since(last.1);
+                if dt.as_secs_f64() >= 0.2 {
+                    let instant = bytes.saturating_sub(last.0) as f64 / dt.as_secs_f64();
                     // Smooth over about two seconds.
                     last.2 = if last.2 == 0.0 {
                         instant
                     } else {
                         last.2 * 0.75 + instant * 0.25
                     };
+                    last.3 = smooth(last.3, instant, dt, ETA_SMOOTHING);
                     (last.0, last.1) = (bytes, now);
                 }
+                let (total_files, total) = *lock(&r.totals);
+                let (mut active, in_flight) = {
+                    let a = lock(&r.counters.active);
+                    let list: Vec<FileProgress> = a
+                        .iter()
+                        .map(|(path, &(done, size))| FileProgress {
+                            path: path.clone(),
+                            done,
+                            size,
+                        })
+                        .collect();
+                    (list, a.values().map(|v| v.0).sum::<u64>())
+                };
+                active.sort_by(|a, b| a.path.cmp(&b.path));
+                active.truncate(ACTIVE_SHOWN);
+                let mut done = r.counters.finished_bytes.load(Ordering::Relaxed) + in_flight;
+                if let Some(t) = total {
+                    done = done.min(t);
+                }
+                let eta =
+                    total.and_then(|t| eta_secs(t - done, last.3, now.duration_since(r.started)));
                 Progress {
                     job,
                     direction: r.direction,
@@ -646,7 +716,11 @@ impl Service {
                     files: r.counters.files.load(Ordering::Relaxed),
                     problems: r.counters.problems.load(Ordering::Relaxed),
                     rate: last.2 as u64,
-                    total: r.total,
+                    total,
+                    total_files,
+                    done,
+                    eta,
+                    active,
                 }
             })
             .collect();
@@ -1442,6 +1516,16 @@ impl Service {
         Ok(job)
     }
 
+    /// Files and bytes a job would send, from a dry run without the item list.
+    async fn count(&self, spec: &JobSpec) -> Result<(u64, u64)> {
+        let opts = TransferOptions {
+            dry_run: true,
+            ..self.job_opts(spec)?
+        };
+        let (files, bytes, _) = self.transfer(spec, &opts).await?;
+        Ok((files, bytes))
+    }
+
     /// Plans a job without transferring: what would be sent, skipped or replaced.
     pub async fn dry_run(&self, spec: &JobSpec) -> Result<DryRun> {
         self.check_job(spec)?;
@@ -1563,8 +1647,9 @@ impl Service {
                 stop: Mutex::new(None),
                 counters: Arc::default(),
                 direction: next.spec.direction,
-                total,
-                last: Mutex::new((0, Instant::now(), 0.0)),
+                totals: Mutex::new((total.map(|_| 1), total)),
+                started: Instant::now(),
+                last: Mutex::new((0, Instant::now(), 0.0, 0.0)),
             });
             if let Err(e) = self.store.set_job_state(next.id, JobState::Running, None) {
                 eprintln!("hopsync: scheduler: {e}");
@@ -1592,23 +1677,46 @@ impl Service {
                         c.bytes.fetch_add(n, Ordering::Relaxed);
                     })
                 };
+                let on_file = {
+                    let c = counters.clone();
+                    Arc::new(move |path: &str, done: u64, size: u64| {
+                        lock(&c.active).insert(path.to_owned(), (done, size));
+                    })
+                };
                 let on_item = {
                     let (c, pending) = (counters.clone(), pending.clone());
                     Arc::new(move |path: &str, out: ItemOutcome<'_>| {
                         match out {
-                            ItemOutcome::Sent { .. } => c.files.fetch_add(1, Ordering::Relaxed),
+                            ItemOutcome::Sent { bytes, .. } => {
+                                c.finished_bytes.fetch_add(bytes, Ordering::Relaxed);
+                                c.files.fetch_add(1, Ordering::Relaxed)
+                            }
                             ItemOutcome::Problem(_) => c.problems.fetch_add(1, Ordering::Relaxed),
                             _ => 0,
                         };
+                        lock(&c.active).remove(path);
                         lock(&pending).push(item_of(path, out));
                     })
                 };
                 let opts = TransferOptions {
                     progress: Some(progress),
                     on_item: Some(on_item),
+                    on_file: Some(on_file),
                     cancel: Some(running.cancel.subscribe()),
                     ..base
                 };
+                // Totals come from a counting walk beside the transfer, so the transfer does not
+                // wait for it. It applies the same destination policy, so skipped files do not
+                // count.
+                let counting = {
+                    let (me, spec, r) = (self.clone(), job.spec.clone(), running.clone());
+                    tokio::spawn(async move {
+                        if let Ok(d) = me.count(&spec).await {
+                            *lock(&r.totals) = (Some(d.0), Some(d.1));
+                        }
+                    })
+                };
+                let _stop_counting = AbortOnDrop(counting);
                 let transfer = self.transfer(&job.spec, &opts);
                 tokio::pin!(transfer);
                 let mut tick = tokio::time::interval(FLUSH_EVERY);
@@ -1778,9 +1886,43 @@ impl Service {
     }
 }
 
+/// Aborts a task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[cfg(test)]
 mod progress_tests {
-    use super::{Direction, Progress};
+    use super::{Direction, Duration, ETA_SMOOTHING, Progress, eta_secs, smooth};
+
+    #[test]
+    fn eta_waits_for_the_ramp_up_and_a_moving_rate() {
+        let s = Duration::from_secs;
+        assert_eq!(eta_secs(1000, 100.0, s(5)), None, "too early");
+        assert_eq!(eta_secs(1000, 0.0, s(60)), None, "nothing moving");
+        assert_eq!(eta_secs(1000, 100.0, s(60)), Some(10));
+        assert_eq!(eta_secs(1001, 100.0, s(60)), Some(11), "rounded up");
+        assert_eq!(eta_secs(0, 100.0, s(60)), Some(0));
+    }
+
+    #[test]
+    fn the_eta_rate_rides_out_a_short_stall() {
+        let tick = Duration::from_millis(500);
+        let mut r = 0.0;
+        for _ in 0..120 {
+            r = smooth(r, 100.0, tick, ETA_SMOOTHING);
+        }
+        assert!((r - 100.0).abs() < 1.0, "settles at the steady rate: {r}");
+        // Two seconds of nothing (a checkpoint, a reconnect) moves it by under a fifth.
+        for _ in 0..4 {
+            r = smooth(r, 0.0, tick, ETA_SMOOTHING);
+        }
+        assert!(r > 80.0, "{r}");
+    }
 
     /// The UI totals upload and download speed from this field.
     #[test]
@@ -1793,6 +1935,10 @@ mod progress_tests {
             problems: 0,
             rate: 4,
             total: None,
+            total_files: None,
+            done: 0,
+            eta: None,
+            active: Vec::new(),
         };
         let json = serde_json::to_value(&p).expect("json");
         assert_eq!(json["direction"], "pull");

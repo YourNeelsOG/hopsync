@@ -6,6 +6,7 @@ pub mod cli;
 pub mod client;
 pub mod daemon;
 pub mod engine;
+pub mod governor;
 pub mod hostkeys;
 pub mod journal;
 pub mod localio;

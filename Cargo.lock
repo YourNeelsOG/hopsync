@@ -1054,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "hopsync"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "argon2",
  "aws-lc-rs",
@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "sftp-bench"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "anyhow",
  "bytes",

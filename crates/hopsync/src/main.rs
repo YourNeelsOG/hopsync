@@ -297,6 +297,17 @@ struct TransferArgs {
     /// Do not record or use the resume journal: interrupted files start over.
     #[arg(long)]
     no_resume: bool,
+    /// Bytes written per file between durability checkpoints (an fsync on the destination, then
+    /// the journal records them). A crash redoes at most this much per file.
+    #[arg(long, value_name = "SIZE", value_parser = parse_size, default_value = "1G")]
+    checkpoint: u64,
+    /// Pace a push's reads once the source disk's average read wait stays above this many
+    /// milliseconds, leaving the disk to others (a torrent client on the same box). 0: never.
+    #[arg(long, value_name = "MS", default_value_t = 40)]
+    io_wait_target: u64,
+    /// Source data read ahead of the network on a push, across all files. Bounds memory.
+    #[arg(long, value_name = "SIZE", value_parser = parse_size, default_value = "128M")]
+    read_ahead: u64,
     /// Read every file back from the destination and compare it with the source (xxh3-128) before
     /// it is renamed into place. Costs a second read at the destination; a push downloads it again.
     #[arg(long)]
@@ -319,10 +330,16 @@ enum Cache {
 
 type Error = Box<dyn std::error::Error>;
 
+const MAX_BLOCKING_THREADS: usize = 64;
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(usize::from(cli.threads))
+        // Blocking work is disk I/O. Tokio's default of 512 threads let a slow hard drive collect
+        // hundreds of threads waiting on it (405 in D state on 2026-11-08); past a few dozen, more
+        // threads only add seeks. Extra work queues instead.
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
         .enable_all()
         .build();
     let result = match rt {
@@ -763,6 +780,10 @@ impl Opts {
             })),
             journal,
             verify: t.verify,
+            checkpoint: t.checkpoint,
+            read_ahead: t.read_ahead,
+            io_wait_target: (t.io_wait_target > 0)
+                .then(|| std::time::Duration::from_millis(t.io_wait_target)),
             ..TransferOptions::default()
         };
         Self { transfer, done }

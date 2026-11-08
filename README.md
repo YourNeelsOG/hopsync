@@ -190,11 +190,33 @@ pulls from any other box over SSH, with no agent to install there:
   files are skipped unless you choose otherwise. Data goes to `name.hopsync-part` and is renamed
   into place only when complete. `--verify` reads every chunk back and compares xxh3-128 hashes
   before the rename.
+- **Easy on hard drives.** Each file is read once, front to back, in 16 MiB blocks, and big files
+  on the same disk take turns, so a seedbox HDD streams instead of seeking. If other programs make
+  the disk slow to answer, Hopsync slows its reads to leave them room.
 - **Light on the box.** Memory has a fixed limit that does not grow with file size. Page cache is
   dropped after streaming, so a shared seedbox keeps its cache for its own work. There are no
   temporary copies.
 
 ## Performance
+
+### Between two hard-drive seedboxes
+
+One 32 GiB file pushed between two shared seedboxes in the same data centre (HDD on both sides,
+0.3 ms apart, 8 Gbit/s). All four runs went back to back in the same hour.
+
+| Tool | Time | Speed | Source disk busy / iowait | Destination disk busy |
+|---|---:|---:|---|---|
+| **Hopsync 1.3** | **3 m 31 s** | **155 MiB/s** | 69 % / 8 % | 90 % |
+| `dd \| ssh \| dd`, 16 MiB blocks | 4 m 25 s | 124 MiB/s | 65 % / 11 % | 62 % |
+| rclone 1.53 (SFTP) | 9 m 11 s | 60 MiB/s | 38 % / 10 % | 32 % |
+| Hopsync 1.2 | 15 m 30 s | 35 MiB/s | 72 % / 47 % | 22 % |
+
+Hopsync 1.3 keeps the source disk about as busy as 1.2 did, but streams instead of seeking, so it
+moves 4.4 times as much data. The destination disk is now the limit. Peak memory was 162 MB.
+[Results and method](docs/benchmarks/2026-11-09-hdd-after/README.md) ·
+[Analysis and design](docs/plans/2026-11-08-hdd-throughput-plan.md) · [Scripts](benches/hdd)
+
+### Over a 200 ms link
 
 Measured against OpenSSH `scp` and `sftp` on a shared seedbox about 200 ms away. Each tool used the
 same server, key and data, one after another.
@@ -242,7 +264,8 @@ These results have limits:
 - The seedbox is shared, so other users' load varies between runs. Real-link results use only 2 runs
   because one `scp` tree run takes over 4 minutes.
 - The real-link big-file runs last about 20 seconds, and that includes the time lanes take to ramp up.
-- `rsync`, `rclone` and `lftp` are not compared yet. Neither is a 1 Gbps link.
+- On the 200 ms link, `rsync`, `rclone` and `lftp` are not compared yet. rclone is compared only on
+  the hard-drive test above.
 
 [Method and caveats](docs/phase1/benchmarks.md) · [Medians as JSON](docs/benchmarks/results.json) ·
 [Benchmark script](benches/bench.py) · [Chart script](benches/charts.py)
@@ -301,7 +324,8 @@ SSH method, but not with servers that also ask for a one-time code.
 On **Transfers** you browse both sides, compare them, select files and folders, and copy them either
 way. Before anything is queued, a preview shows what would be new, replaced or skipped. No question
 interrupts a running job. Jobs can be paused, resumed, cancelled, retried and reordered, and they
-survive a daemon restart. Each job has a page that lists every file and why it was skipped or failed.
+survive a daemon restart. While a job runs, the queue shows its total size and file count, how
+much is done, the speed, the time left, and a bar for each file in flight. Each job has a page that lists every file and why it was skipped or failed.
 
 <p align="center"><img src="docs/assets/screens/transfers-phone.png" alt="The Hopsync web UI at phone width, with live speeds at the top and the panes stacked." width="280"></p>
 
@@ -331,6 +355,9 @@ hopsync pull user@seedbox.example.com:downloads/Datasets ./
 | `--min-free 10G` | Refuse files that would leave less free space than this at the destination. |
 | `--cache keep` | Keep transferred data in the page cache. The default drops it. |
 | `--no-resume` | Do not record or use the resume journal. |
+| `--checkpoint 1G` | How much of a file is written between durability checkpoints. A crash redoes at most this much per file. `0` checkpoints every 16 MiB chunk. |
+| `--read-ahead 128M` | Memory for source data read ahead of the network. |
+| `--io-wait-target 40` | Slow down reading when the source disk takes longer than this many milliseconds per read. `0` turns it off. |
 
 `hopsync push --help` lists every option.
 
@@ -384,7 +411,8 @@ Read them here: [engine](docs/phase1/security-review.md), [daemon](docs/phase2/s
 | Built-in TLS, fuzzing | Not started |
 | Packages (`.deb`, AUR, Docker) | Not started |
 | Independent security review | Not started |
-| Comparison with `rsync`, `rclone` and `lftp`, and a 1 Gbps test | Not started |
+| Comparison with rclone on hard-drive seedboxes | Done |
+| Comparison with `rsync` and `lftp`, and on the 200 ms link | Not started |
 
 Known limits today:
 
@@ -392,8 +420,6 @@ Known limits today:
   are refused with a message that says so, and `ssh-agent` is not used. Keys that Hopsync creates
   avoid all of this.
 - A server with only RSA host keys cannot be added. Most servers also have an ed25519 host key.
-- The queue shows a percentage and time left only for a single-file upload. Downloads and folders
-  show speed and bytes so far.
 - A transfer runs between the box running Hopsync and one server. To copy between two other boxes,
   run Hopsync on one of them.
 - Symlinks are skipped and reported.
@@ -407,6 +433,7 @@ The roadmap and every design decision with its reason are in [plan.md](plan.md).
 |---|---|
 | Design, roadmap and decision log | [plan.md](plan.md) |
 | Benchmark method and results | [docs/phase1/benchmarks.md](docs/phase1/benchmarks.md) |
+| Hard-drive throughput: analysis, design and results | [docs/plans/2026-11-08-hdd-throughput-plan.md](docs/plans/2026-11-08-hdd-throughput-plan.md) |
 | Research on SSH libraries and link behavior | [docs/phase0](docs/phase0) |
 | UX study of rclone, rsync, lsyncd and FileZilla | [docs/research/ux-study.md](docs/research/ux-study.md) |
 

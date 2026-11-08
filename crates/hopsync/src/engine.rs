@@ -42,7 +42,7 @@ use crate::localio::{CachePolicy, ChunkWriter, LocalReader, LocalWriter};
 use crate::paths::{EntryKind, LocalRoot, Name, OpenMode, RelPath, RemoteRoot};
 use crate::plan::{self, PlanConfig, Range};
 use crate::policy::{self, Decision, Existing, Found};
-use crate::pool::BufferPool;
+use crate::pool::{Budgeted, BufferPool, ByteBudget};
 use crate::sftp::{RemoteFile, RemoteKind, RemoteOpenMode, Sftp, SftpError, SftpOptions};
 use crate::ssh::{SshError, SshOptions, SshTarget, connect};
 use crate::tune::Tuner;
@@ -56,6 +56,14 @@ const FSYNC_MIN: u64 = 1 << 20;
 
 /// Called with the byte count of each piece as it completes. Retried pieces are reported again.
 pub type ProgressFn = Arc<dyn Fn(u64) + Send + Sync>;
+
+/// Called for each read of a push's source: path relative to the source top, offset, length.
+/// For tests and benchmarks that check the disk access pattern.
+pub type ReadFn = Arc<dyn Fn(&str, u64, usize) + Send + Sync>;
+
+/// Called as a file's bytes land: path relative to the source top, bytes done (resumed ones
+/// included, never past the size), and size. Feeds per-file progress bars.
+pub type FileFn = Arc<dyn Fn(&str, u64, u64) + Send + Sync>;
 
 /// Called once per source file with its path relative to the source top and how it ended.
 pub type ItemFn = Arc<dyn Fn(&str, ItemOutcome<'_>) + Send + Sync>;
@@ -97,7 +105,25 @@ pub struct TransferOptions {
     pub retries: u32,
     pub ssh: SshOptions,
     pub sftp: SftpOptions,
+    /// Bytes per source read on a push. The source is read once, front to back, in blocks this
+    /// big; lanes only carry the data. Hard drives stream large in-order reads and seek on anything
+    /// else.
+    pub read_block: usize,
+    /// Bytes read from the source but not yet acknowledged by the destination, across the
+    /// transfer. Bounds a push's memory; a full budget pauses reading.
+    pub read_ahead: u64,
+    /// Bytes of a file written between durability checkpoints (one `fsync@` or `fsync`, then the
+    /// journal records the chunks). A crash redoes at most this much per file. 0: every chunk.
+    pub checkpoint: u64,
+    /// Files at least this big read from a disk only when no other transfer in this process is
+    /// reading such a file from the same disk (`disk_gate`). Smaller files are never held back.
+    pub big_file: u64,
+    /// I/O governor: once the source disk's average read wait stays above this, a push paces its
+    /// reads to leave the disk to others (see `governor`). None: never pace.
+    pub io_wait_target: Option<Duration>,
     pub progress: Option<ProgressFn>,
+    pub on_read: Option<ReadFn>,
+    pub on_file: Option<FileFn>,
     /// Records durable chunks of multi-chunk files so an interrupted transfer resumes. None: every
     /// run starts files from zero.
     pub journal: Option<Arc<Journal>>,
@@ -125,7 +151,14 @@ impl Default for TransferOptions {
             retries: 8,
             ssh: SshOptions::default(),
             sftp: SftpOptions::default(),
+            read_block: 16 << 20,
+            read_ahead: 128 << 20,
+            checkpoint: 1 << 30,
+            big_file: 64 << 20,
+            io_wait_target: Some(Duration::from_millis(40)),
             progress: None,
+            on_read: None,
+            on_file: None,
             journal: None,
             verify: false,
             dry_run: false,
@@ -874,6 +907,10 @@ struct FileState {
     check: OnceCell<Arc<LocalReader>>,
     /// Local side, opened by the first worker to need it and closed with the last reference.
     local: OnceCell<LocalSide>,
+    /// Chunks written since the last durability checkpoint, and their bytes (`record_durable`).
+    unsynced: Mutex<(Vec<u64>, u64)>,
+    /// Bytes landed, for `on_file`; resumed bytes count from the start.
+    done: AtomicU64,
 }
 
 enum FileEnds {
@@ -952,6 +989,8 @@ impl FileState {
             distrust: AtomicBool::new(false),
             check: OnceCell::new(),
             local: OnceCell::new(),
+            unsynced: Mutex::new((Vec::new(), 0)),
+            done: AtomicU64::new(0),
         }
     }
 
@@ -988,6 +1027,9 @@ struct Item {
     range: Range,
     /// Made durable by an earlier run: only verified, not sent again.
     resumed: bool,
+    /// A push's chunk, already read from the source by the producer. Workers only send it, so the
+    /// source is read once, in order, however many lanes carry the data.
+    data: Option<Arc<Budgeted>>,
 }
 
 /// One lane: its current session, and whether it ever connected.
@@ -1010,6 +1052,28 @@ struct SlotState {
 /// `MaxStartups` (default 10, often lower on shared boxes).
 const CONNECTING: usize = 2;
 
+/// One turn per source disk for big files, across every transfer in the process: a hard drive
+/// streams one file well and two badly. Keyed by `st_dev`.
+static DISK_TURNS: std::sync::LazyLock<Mutex<HashMap<u64, Arc<Semaphore>>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// Waits for the disk's turn. None when the device cannot be told (no turn-taking then).
+async fn disk_turn(reader: &LocalReader) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let dev = reader.device().ok()?;
+    let turn = DISK_TURNS
+        .lock()
+        .ok()?
+        .entry(dev)
+        .or_insert_with(|| Arc::new(Semaphore::new(1)))
+        .clone();
+    turn.acquire_owned().await.ok()
+}
+
+/// Request timeout of the durability session. An fsync flushes everything the destination holds
+/// for the file, which on a hard drive with many GiB of dirty pages takes minutes; it must not be
+/// mistaken for a lost connection (2026-11-09: 60 s fsyncs cost 6 reconnects in a 32 GiB push).
+const SYNC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// How often auto-tune measures throughput.
 const TUNE_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -1028,6 +1092,14 @@ fn may_retire(e: &TransferError) -> bool {
     )
 }
 
+/// The durability session's state. A server that refuses one more connection (a connection cap,
+/// `MaxStartups`) leaves it `Unavailable`, and fsyncs go over the lane that wrote, as before.
+enum SyncSession {
+    Untried,
+    Ready(Sftp),
+    Unavailable,
+}
+
 struct Shared {
     dir: Direction,
     /// Journal job key: direction, account, and both roots.
@@ -1036,12 +1108,19 @@ struct Shared {
     local: LocalRoot,
     opts: TransferOptions,
     pool: BufferPool,
+    /// Push data read ahead of the network (`read_ahead`).
+    budget: ByteBudget,
     piece: usize,
     slots: Vec<Slot>,
     /// Lanes that have connected at least once.
     lanes_up: AtomicUsize,
     generations: AtomicU64,
     connecting: Semaphore,
+    /// A session of its own for push fsyncs (`sync_remote`), so a long flush blocks no lane:
+    /// sftp-server answers one request at a time, so writes queued behind an fsync would wait too.
+    sync: tokio::sync::Mutex<SyncSession>,
+    /// One governor per source device; None where the device cannot be watched.
+    governors: Mutex<HashMap<u64, Option<crate::governor::Governor>>>,
     /// Bytes moved, for auto-tune.
     moved: AtomicU64,
     /// Items queued and not yet finished.
@@ -1133,6 +1212,52 @@ impl Shared {
         }
     }
 
+    /// Makes a remote file durable (`fsync@openssh.com`) over the durability session, connecting
+    /// it on first use. fsync flushes the file's dirty pages whichever process wrote them, so it
+    /// covers every write the lanes had acknowledged. Without that session, `lane` (a handle on
+    /// the file from the calling worker's lane) is used. `Unsupported` when the server lacks fsync@.
+    async fn sync_remote(&self, path: &str, lane: &RemoteFile) -> Result<(), TransferError> {
+        let mut guard = self.sync.lock().await;
+        if matches!(*guard, SyncSession::Untried) {
+            let connected = async {
+                let _permit = self.connecting.acquire().await.ok();
+                let conn = connect(&self.remote.target, &self.remote.known, &self.opts.ssh)
+                    .await
+                    .map_err(SftpError::from)?;
+                let sftp_opts = SftpOptions {
+                    request_timeout: SYNC_TIMEOUT,
+                    ..self.opts.sftp.clone()
+                };
+                Ok::<_, TransferError>(Sftp::start(&conn, sftp_opts).await?)
+            }
+            .await;
+            *guard = match connected {
+                Ok(s) => SyncSession::Ready(s),
+                // A host key that differs from the lanes' is the attack pinning exists to stop.
+                Err(e) if !may_retire(&e) => return Err(e),
+                Err(_) => SyncSession::Unavailable,
+            };
+        }
+        let SyncSession::Ready(sftp) = &*guard else {
+            drop(guard);
+            return lane.fsync().await.map_err(TransferError::from);
+        };
+        let sftp = sftp.clone();
+        let result = async {
+            let f = sftp.open(path, RemoteOpenMode::Write).await?;
+            let synced = f.fsync().await;
+            let _ = f.close().await;
+            synced
+        }
+        .await
+        .map_err(TransferError::from);
+        if result.as_ref().is_err_and(is_transient) {
+            // Reconnect on the next checkpoint; this one is redone by the caller's retry.
+            *guard = SyncSession::Untried;
+        }
+        result
+    }
+
     /// Drops the lane's session if it is still the one that failed.
     async fn invalidate(&self, slot: usize, generation: u64) {
         let mut st = self.slots[slot].state.lock().await;
@@ -1201,6 +1326,16 @@ impl Shared {
         self.moved.fetch_add(n, Ordering::Relaxed);
         if let Some(p) = &self.opts.progress {
             p(n);
+        }
+    }
+
+    /// `progress`, and the file's own count for `on_file`.
+    fn file_progress(&self, file: &FileState, n: u64) {
+        self.progress(n);
+        let done = file.done.fetch_add(n, Ordering::Relaxed) + n;
+        if let Some(f) = &self.opts.on_file {
+            // Pieces redone after a reconnect count twice in `done`; the bar stops at full.
+            f(&file.label, done.min(file.size), file.size);
         }
     }
 
@@ -1293,6 +1428,10 @@ impl Shared {
             *left -= need;
         }
         if resumed > 0 {
+            file.done.store(resumed, Ordering::Relaxed);
+            if let Some(f) = &self.opts.on_file {
+                f(&file.label, resumed, file.size);
+            }
             // The part already exists and holds those chunks: never recreate it.
             file.part_created.store(true, Ordering::Relaxed);
             if let Ok(mut r) = self.report.lock() {
@@ -1321,12 +1460,33 @@ impl Shared {
             },
             false,
         ));
+        // Held from a big file's first read to its last, never while only sending.
+        let mut turn = None;
         for (index, range, resumed) in chunks.chain(finalize_only) {
+            let data = if self.dir == Direction::Push && !resumed && range.len > 0 {
+                if turn.is_none()
+                    && file.size >= self.opts.big_file
+                    && let Ok(LocalSide::Reader(r)) = self.local_side(&file).await
+                {
+                    turn = disk_turn(r).await;
+                }
+                match self.read_chunk(&file, range).await {
+                    Ok(d) => Some(Arc::new(d)),
+                    Err(e) => {
+                        // Chunks already queued finish on their own; the file is not finalized.
+                        self.fail_file(&file, e);
+                        return true;
+                    }
+                }
+            } else {
+                None
+            };
             let item = Item {
                 file: file.clone(),
                 index,
                 range,
                 resumed,
+                data,
             };
             self.pending.fetch_add(1, Ordering::SeqCst);
             // `finished` before the producer is done means the transfer aborted: the workers are
@@ -1341,6 +1501,62 @@ impl Shared {
             }
         }
         true
+    }
+
+    /// Reads `range` of a push's source in `read_block` reads, front to back, into a buffer held
+    /// under the read-ahead budget. Called by the producer only, so the source disk sees one
+    /// sequential stream per transfer.
+    async fn read_chunk(&self, file: &FileState, range: Range) -> Result<Budgeted, TransferError> {
+        let LocalSide::Reader(reader) = self.local_side(file).await? else {
+            unreachable!("a push's local side is always a reader")
+        };
+        let len = usize::try_from(range.len)
+            .map_err(|_| TransferError::SourceChanged(file.label.clone()))?;
+        if let Some(target) = self.opts.io_wait_target
+            && let Ok(dev) = reader.device()
+        {
+            let pause = self.governors.lock().ok().and_then(|mut g| {
+                g.entry(dev)
+                    .or_insert_with(|| crate::governor::Governor::for_device(dev, target))
+                    .as_mut()
+                    .map(crate::governor::Governor::pause)
+            });
+            if let Some(p) = pause.filter(|p| !p.is_zero()) {
+                tokio::time::sleep(p).await;
+            }
+        }
+        let mut buf = self.budget.acquire(len).await;
+        let (reader, block, label, on_read) = (
+            reader.clone(),
+            self.opts.read_block.max(plan::ALIGN as usize),
+            file.label.clone(),
+            self.opts.on_read.clone(),
+        );
+        let path = file.label.clone();
+        blocking(move || {
+            let mut done = 0;
+            while done < len {
+                let n = block.min(len - done);
+                let at = range.offset + done as u64;
+                let got = reader.read_at(at, &mut buf.data[done..done + n])?;
+                if let Some(f) = &on_read {
+                    f(&path, at, n);
+                }
+                if got != n {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "source shrank",
+                    ));
+                }
+                done += n;
+            }
+            Ok(buf)
+        })
+        .await
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::UnexpectedEof => TransferError::SourceChanged(label.clone()),
+            _ => local_err(&label)(e),
+        })
     }
 
     /// Whether the part file left by an earlier run still covers the recorded chunks. A part that
@@ -1390,10 +1606,9 @@ impl Shared {
                         if m.len() != *len {
                             return Err(TransferError::SourceChanged(file.label.clone()));
                         }
-                        Ok(LocalSide::Reader(Arc::new(LocalReader::new(
-                            f,
-                            self.opts.cache,
-                        ))))
+                        let reader = LocalReader::new(f, self.opts.cache);
+                        reader.advise_sequential();
+                        Ok(LocalSide::Reader(Arc::new(reader)))
                     }
                     FileEnds::Pull { part, dst, .. } => {
                         let f = self
@@ -1406,10 +1621,9 @@ impl Shared {
                                     local_err(&file.label)(e)
                                 }
                             })?;
-                        Ok(LocalSide::Writer(Arc::new(LocalWriter::new(
-                            f,
-                            self.opts.cache,
-                        ))))
+                        let writer = LocalWriter::new(f, self.opts.cache);
+                        writer.preallocate(file.size);
+                        Ok(LocalSide::Writer(Arc::new(writer)))
                     }
                 }
             })
@@ -1484,11 +1698,14 @@ where
         opts: opts.clone(),
         // Sized for the ceiling; buffers are allocated on first use.
         pool: BufferPool::new(max_lanes * depth, piece),
+        budget: ByteBudget::new(opts.read_ahead),
         piece,
         slots,
         lanes_up: AtomicUsize::new(1),
         generations: AtomicU64::new(1),
         connecting: Semaphore::new(CONNECTING),
+        sync: tokio::sync::Mutex::new(SyncSession::Untried),
+        governors: Mutex::default(),
         moved: AtomicU64::new(0),
         pending: AtomicU64::new(0),
         producer_done: AtomicBool::new(false),
@@ -2053,7 +2270,7 @@ async fn transfer_with_retry(
             if item.resumed {
                 return verify_chunk(shared, side, &handle, &item.file, item.range, None).await;
             }
-            let hash = transfer_chunk(shared, side, &handle, &item.file, item.range).await?;
+            let hash = transfer_chunk(shared, side, &handle, item).await?;
             if shared.opts.verify {
                 verify_chunk(shared, side, &handle, &item.file, item.range, hash).await?;
             }
@@ -2072,8 +2289,11 @@ async fn transfer_with_retry(
     }
 }
 
-/// Makes the chunk durable at the destination and records it in the journal. A server without
-/// `fsync@` gets no records: its chunks are never claimed durable, so a resume redoes them.
+/// Adds the chunk to its file's checkpoint batch. Once the batch holds `checkpoint` bytes, makes
+/// the file durable at the destination (one `fsync@` or `fsync` covers every chunk written before
+/// it) and records the batch in the journal. A server without `fsync@` gets no records: its chunks
+/// are never claimed durable, so a resume redoes them. Chunks still in an unfinished batch when the
+/// file completes need no record: the journal row is dropped with the finished file.
 async fn record_durable(
     shared: &Shared,
     item: &Item,
@@ -2086,11 +2306,23 @@ async fn record_durable(
     if item.range.len == 0 {
         return Ok(());
     }
+    let batch = {
+        let Ok(mut u) = item.file.unsynced.lock() else {
+            return Ok(());
+        };
+        u.0.push(item.index);
+        u.1 += item.range.len;
+        if u.1 < shared.opts.checkpoint {
+            return Ok(());
+        }
+        u.1 = 0;
+        std::mem::take(&mut u.0)
+    };
     match side {
-        LocalSide::Reader(_) => match handle.fsync().await {
+        LocalSide::Reader(_) => match shared.sync_remote(item.file.remote_path(), handle).await {
             Ok(()) => {}
-            Err(SftpError::Unsupported(_)) => return Ok(()),
-            Err(e) => return Err(e.into()),
+            Err(TransferError::Remote(SftpError::Unsupported(_))) => return Ok(()),
+            Err(e) => return Err(e),
         },
         LocalSide::Writer(w) => {
             let w = w.clone();
@@ -2099,8 +2331,8 @@ async fn record_durable(
                 .map_err(local_err(&item.file.label))?;
         }
     }
-    // Losing this record costs a redone chunk on resume, nothing more.
-    let _ = journal.mark_done(id, item.index);
+    // Losing these records costs redone chunks on resume, nothing more.
+    let _ = journal.mark_done_many(id, &batch);
     Ok(())
 }
 
@@ -2215,9 +2447,9 @@ async fn finalize(
         ) => {
             handle.set_len(file.size).await?;
             if file.size >= FSYNC_MIN {
-                match handle.fsync().await {
-                    Ok(()) | Err(SftpError::Unsupported(_)) => {}
-                    Err(e) => return Err(e.into()),
+                match shared.sync_remote(part, handle).await {
+                    Ok(()) | Err(TransferError::Remote(SftpError::Unsupported(_))) => {}
+                    Err(e) => return Err(e),
                 }
             }
             let now = shared.local.metadata(src).map_err(local_err(&file.label))?;
@@ -2323,11 +2555,15 @@ async fn transfer_chunk(
     shared: &Arc<Shared>,
     side: &LocalSide,
     handle: &Arc<RemoteFile>,
-    file: &FileState,
-    range: Range,
+    item: &Item,
 ) -> Result<Option<u128>, TransferError> {
+    let (file, range) = (&item.file, item.range);
     match side {
-        LocalSide::Reader(reader) => push_chunk(shared, reader, handle, file, range).await,
+        LocalSide::Reader(_) => match &item.data {
+            Some(data) => push_chunk(shared, data, handle, file, range).await,
+            // Only an empty range (a zero-byte file, or finalize-only) carries no data.
+            None => Ok(None),
+        },
         LocalSide::Writer(writer) => {
             pull_chunk(shared, writer.chunk(range.offset), handle, file, range).await
         }
@@ -2344,53 +2580,37 @@ async fn next_buffer(shared: &Shared, pipeline_empty: bool) -> Option<crate::poo
     }
 }
 
+/// Sends a chunk the producer already read, as an ordered pipeline of up to `inflight` writes.
 async fn push_chunk(
     shared: &Arc<Shared>,
-    reader: &Arc<LocalReader>,
+    data: &Arc<Budgeted>,
     handle: &Arc<RemoteFile>,
     file: &FileState,
     range: Range,
 ) -> Result<Option<u128>, TransferError> {
-    let mut hasher = shared.opts.verify.then(XxHash3_128::new);
+    let hash = shared.opts.verify.then(|| {
+        let mut h = XxHash3_128::new();
+        h.write(&data.data);
+        h.finish_128()
+    });
     let mut pipe = Pipeline(VecDeque::new());
-    let mut off = range.offset;
-    while off < range.end() || !pipe.0.is_empty() {
-        let room = off < range.end() && pipe.0.len() < shared.depth();
-        let buf = if room {
-            next_buffer(shared, pipe.0.is_empty()).await
-        } else {
-            None
-        };
-        if let Some(mut buf) = buf {
-            let len = shared
-                .piece
-                .min(usize::try_from(range.end() - off).unwrap_or(usize::MAX));
-            let (reader, handle, at, label) =
-                (reader.clone(), handle.clone(), off, file.label.clone());
+    let mut at = 0usize;
+    let len = data.data.len();
+    while at < len || !pipe.0.is_empty() {
+        if at < len && pipe.0.len() < shared.depth() {
+            let n = shared.piece.min(len - at);
+            let (data, handle, off) = (data.clone(), handle.clone(), range.offset + at as u64);
             pipe.0.push_back(tokio::spawn(async move {
-                let read = blocking(move || {
-                    let n = reader.read_at(at, &mut buf[..len])?;
-                    Ok((buf, n))
-                })
-                .await;
-                let (buf, n) = read.map_err(local_err(&label))?;
-                if n != len {
-                    return Err(TransferError::SourceChanged(label));
-                }
-                handle.write_at(at, &buf[..len]).await?;
-                Ok((buf, len))
+                handle.write_at(off, &data.data[at..at + n]).await?;
+                Ok::<_, TransferError>(n)
             }));
-            off += len as u64;
+            at += n;
         } else if let Some(h) = pipe.0.pop_front() {
-            // Joined in order, so the hash sees the chunk's bytes in order.
-            let (buf, len) = join(h, &file.label).await?;
-            if let Some(h) = &mut hasher {
-                h.write(&buf[..len]);
-            }
-            shared.progress(len as u64);
+            let n = join(h, &file.label).await?;
+            shared.file_progress(file, n as u64);
         }
     }
-    Ok(hasher.map(|h| h.finish_128()))
+    Ok(hash)
 }
 
 async fn pull_chunk(
@@ -2439,7 +2659,7 @@ async fn pull_chunk(
             .await
             .map_err(local_err(&file.label))?;
             writer = Some(w);
-            shared.progress(len as u64);
+            shared.file_progress(file, len as u64);
         }
     }
     if let Some(w) = writer {

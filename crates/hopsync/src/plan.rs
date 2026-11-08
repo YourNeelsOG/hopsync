@@ -21,8 +21,10 @@ impl Default for PlanConfig {
     fn default() -> Self {
         Self {
             lanes: 4,
-            min_chunk: 8 << 20,
-            max_chunk: 64 << 20,
+            // One chunk is one push read-ahead unit (TransferOptions::read_block): every chunk in
+            // flight sits next to the read front, so the destination sees forward-moving writes.
+            min_chunk: 16 << 20,
+            max_chunk: 16 << 20,
         }
     }
 }
@@ -181,12 +183,26 @@ mod tests {
         );
     }
 
+    /// The size-by-lanes split, with the 8 to 64 MiB range a caller may still configure.
+    fn split(lanes: u32) -> PlanConfig {
+        PlanConfig {
+            lanes,
+            min_chunk: 8 * MIB,
+            max_chunk: 64 * MIB,
+        }
+    }
+
+    #[test]
+    fn default_chunks_are_one_16_mib_read_block() {
+        let cfg = PlanConfig::default();
+        assert_eq!(chunk_size(50 * GIB, &cfg), 16 * MIB);
+        assert_eq!(chunk_size(40 * MIB, &cfg), 16 * MIB);
+        assert_eq!(chunks(40 * MIB + 1, &cfg).len(), 3);
+    }
+
     #[test]
     fn medium_file_is_split_across_lanes() {
-        let cfg = PlanConfig {
-            lanes: 8,
-            ..PlanConfig::default()
-        };
+        let cfg = split(8);
         // 100 MiB / 8 lanes = 12.5 MiB, rounded up to 13 MiB: 8 chunks, every lane busy.
         assert_eq!(chunk_size(100 * MIB, &cfg), 13 * MIB);
         assert_eq!(chunks(100 * MIB, &cfg).len(), 8);
@@ -194,7 +210,7 @@ mod tests {
 
     #[test]
     fn huge_file_uses_max_chunk() {
-        let cfg = PlanConfig::default();
+        let cfg = split(4);
         assert_eq!(chunk_size(50 * GIB, &cfg), 64 * MIB);
         assert_eq!(chunks(50 * GIB, &cfg).len(), 800);
     }
