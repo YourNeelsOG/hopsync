@@ -166,6 +166,21 @@ impl Journal {
         Ok(())
     }
 
+    /// Records several durable chunks in one transaction.
+    pub fn mark_done_many(&self, id: i64, idx: &[u64]) -> Result<(), JournalError> {
+        let mut db = self.lock()?;
+        let tx = db.transaction()?;
+        {
+            let mut st =
+                tx.prepare_cached("INSERT OR IGNORE INTO chunks (file, idx) VALUES (?1, ?2)")?;
+            for &i in idx {
+                st.execute(params![id, to_i64(i)?])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Drops the recorded chunks of `id` but keeps the row (the file restarts under the same id).
     pub fn reset(&self, id: i64) -> Result<(), JournalError> {
         self.lock()?

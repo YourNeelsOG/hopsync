@@ -38,6 +38,10 @@ const progress = (job: number, direction: "push" | "pull", rate: number, bytes =
   problems: 0,
   rate,
   total: 100,
+  total_files: null,
+  done: bytes,
+  eta: null,
+  active: [],
 });
 
 function start() {

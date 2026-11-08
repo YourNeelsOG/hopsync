@@ -42,7 +42,15 @@ function sameProgress(a: Progress, b: Progress): boolean {
     a.problems === b.problems &&
     a.rate === b.rate &&
     a.total === b.total &&
-    a.direction === b.direction
+    a.total_files === b.total_files &&
+    a.done === b.done &&
+    a.eta === b.eta &&
+    a.direction === b.direction &&
+    a.active.length === b.active.length &&
+    a.active.every((f, i) => {
+      const g = b.active[i];
+      return g !== undefined && f.path === g.path && f.done === g.done && f.size === g.size;
+    })
   );
 }
 

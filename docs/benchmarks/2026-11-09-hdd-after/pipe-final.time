@@ -1,0 +1,23 @@
+	Command being timed: "sh -c dd if=test32g.bin bs=16M iflag=direct status=none | ssh -c aes128-gcm@openssh.com -i key -o IdentitiesOnly=yes -o UserKnownHostsFile=known_hosts -o BatchMode=yes user@dst "dd of=hopsync-bench/pipe-final.bin bs=16M iflag=fullblock conv=fdatasync status=none""
+	User time (seconds): 26.06
+	System time (seconds): 55.14
+	Percent of CPU this job got: 30%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 4:24.83
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 17920
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 26373
+	Voluntary context switches: 1166526
+	Involuntary context switches: 2833
+	Swaps: 0
+	File system inputs: 67108864
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

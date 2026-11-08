@@ -839,3 +839,56 @@ async fn a_generated_key_is_installed_with_an_existing_login_once() {
         "installing twice adds nothing"
     );
 }
+
+/// A running tree job reports what it will send before its walk is done: files and bytes from a
+/// counting walk beside the transfer, bytes landed, and the files in flight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tree_job_reports_its_totals_while_running() {
+    let Some(e) = env() else { return };
+    let dir = e.local.path().join("tree");
+    std::fs::create_dir(&dir).expect("mkdir");
+    let (files, size) = (8u64, 64usize << 20);
+    for i in 0..files {
+        std::fs::write(dir.join(format!("f{i}")), vec![i as u8; size]).expect("write");
+    }
+    let svc = e.open();
+    let id = trusted(&svc, &e, "box").await;
+    let mut snaps = svc.subscribe();
+    let job = svc
+        .add_job(&JobSpec {
+            lanes: Some(1),
+            ..push(id, "tree", "tree")
+        })
+        .expect("queue");
+    let mut seen = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while seen.is_none() && tokio::time::Instant::now() < deadline {
+        if tokio::time::timeout(Duration::from_secs(1), snaps.changed())
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let snap = snaps.borrow_and_update().clone();
+        if let Some(p) = snap
+            .running
+            .iter()
+            .find(|p| p.job == job.id && p.total_files.is_some())
+        {
+            seen = Some(p.clone());
+        }
+        if svc.store.job(job.id).expect("job").state.is_final() {
+            break;
+        }
+    }
+    let p = seen.expect("a running snapshot with totals");
+    assert_eq!(p.total_files, Some(files));
+    assert_eq!(p.total, Some(files * size as u64));
+    assert!(p.done <= files * size as u64);
+    assert!(p.active.len() <= 16);
+    for f in &p.active {
+        assert!(f.done <= f.size && f.size == size as u64, "{f:?}");
+    }
+    let done = wait_for(&svc, job.id, |j| j.state.is_final()).await;
+    assert_eq!(done.state, JobState::Done, "{:?}", done.error);
+}

@@ -124,6 +124,89 @@ impl Drop for Buffer {
     }
 }
 
+/// Caps the bytes held in variable-size buffers, for data read ahead of the network. A request
+/// larger than the whole budget takes all of it, so one big block never waits forever. Released
+/// buffers are kept and reused: allocating a fresh 16 MiB block per chunk let freed blocks pile up
+/// in the allocator's per-thread arenas (247 MB peak RSS against a 128 MiB budget, 2026-11-09).
+#[derive(Clone)]
+pub struct ByteBudget {
+    permits: Arc<Semaphore>,
+    /// Permits are KiB, so a budget of many GiB fits the semaphore's `u32` acquire count.
+    total: u32,
+    free: Arc<Mutex<Vec<Vec<u8>>>>,
+    allocated: Arc<Mutex<usize>>,
+}
+
+/// Bytes owned under a `ByteBudget`; the buffer and the budget are given back on drop.
+pub struct Budgeted {
+    pub data: Vec<u8>,
+    free: Arc<Mutex<Vec<Vec<u8>>>>,
+    // Dropped after `Drop::drop` has put the buffer back.
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for Budgeted {
+    fn drop(&mut self) {
+        if let Ok(mut free) = self.free.lock() {
+            free.push(std::mem::take(&mut self.data));
+        }
+    }
+}
+
+impl ByteBudget {
+    /// `bytes` is raised to at least 1 KiB.
+    pub fn new(bytes: u64) -> Self {
+        let total = u32::try_from(bytes.div_ceil(1024))
+            .unwrap_or(u32::MAX)
+            .max(1);
+        Self {
+            permits: Arc::new(Semaphore::new(total as usize)),
+            total,
+            free: Arc::default(),
+            allocated: Arc::default(),
+        }
+    }
+
+    /// Waits until `len` bytes fit, then returns a buffer of that length. Its contents are
+    /// whatever an earlier holder left (the same transfer's data) or zeros; callers overwrite it.
+    pub async fn acquire(&self, len: usize) -> Budgeted {
+        let kib = u32::try_from(len.div_ceil(1024))
+            .unwrap_or(u32::MAX)
+            .clamp(1, self.total);
+        // The budget owns the semaphore and never closes it.
+        let Ok(permit) = self.permits.clone().acquire_many_owned(kib).await else {
+            unreachable!("byte budget semaphore is never closed")
+        };
+        // Largest free buffer first, so a full-size block rarely has to grow a small one.
+        let reused = self.free.lock().ok().and_then(|mut f| {
+            let i = (0..f.len()).max_by_key(|&i| f[i].capacity())?;
+            Some(f.swap_remove(i))
+        });
+        let mut data = reused.unwrap_or_else(|| {
+            if let Ok(mut n) = self.allocated.lock() {
+                *n += 1;
+            }
+            Vec::new()
+        });
+        data.resize(len, 0);
+        Budgeted {
+            data,
+            free: self.free.clone(),
+            _permit: permit,
+        }
+    }
+
+    /// KiB not currently held.
+    pub fn available_kib(&self) -> usize {
+        self.permits.available_permits()
+    }
+
+    /// Buffers created so far; reuse keeps this near the number held at once.
+    pub fn allocated(&self) -> usize {
+        self.allocated.lock().map_or(0, |n| *n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +287,48 @@ mod tests {
         let pool = BufferPool::new(0, 0);
         assert_eq!(pool.capacity(), 1);
         assert_eq!(pool.acquire().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn byte_budget_bounds_bytes_held_and_wakes_waiters() {
+        let budget = ByteBudget::new(10 << 10);
+        let a = budget.acquire(6 << 10).await;
+        assert_eq!(a.data.len(), 6 << 10);
+        let waiter = tokio::spawn({
+            let budget = budget.clone();
+            async move { budget.acquire(6 << 10).await.data.len() }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "12 KiB must not fit a 10 KiB budget");
+        drop(a);
+        assert_eq!(waiter.await.expect("waiter"), 6 << 10);
+        assert_eq!(budget.available_kib(), 10);
+    }
+
+    #[tokio::test]
+    async fn a_request_above_the_budget_takes_all_of_it() {
+        let budget = ByteBudget::new(4 << 10);
+        let big = budget.acquire(1 << 20).await;
+        assert_eq!(big.data.len(), 1 << 20);
+        assert_eq!(budget.available_kib(), 0);
+        drop(big);
+        assert_eq!(budget.available_kib(), 4);
+    }
+
+    #[tokio::test]
+    async fn byte_budget_reuses_released_buffers() {
+        let budget = ByteBudget::new(64 << 10);
+        for _ in 0..50 {
+            let a = budget.acquire(16 << 10).await;
+            let b = budget.acquire(16 << 10).await;
+            drop((a, b));
+        }
+        assert_eq!(budget.allocated(), 2, "two buffers serve every round");
+        let small = budget.acquire(100).await;
+        assert_eq!(
+            small.data.len(),
+            100,
+            "a reused buffer is cut to the request"
+        );
     }
 }

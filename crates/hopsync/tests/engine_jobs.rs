@@ -192,6 +192,8 @@ async fn a_cancel_stops_quickly_and_the_next_run_resumes() {
             min_chunk: 8 << 20,
             max_chunk: 8 << 20,
         },
+        // Each chunk its own checkpoint, so chunks are durable before the cancel.
+        checkpoint: 8 << 20,
         journal: Some(journal.clone()),
         cancel: Some(cancel_rx),
         progress: Some(progress),

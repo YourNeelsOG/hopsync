@@ -101,14 +101,29 @@ export interface AuditRow {
   detail: string;
 }
 
+export interface FileProgress {
+  path: string;
+  done: number;
+  size: number;
+}
+
 export interface Progress {
   job: number;
   direction: Direction;
+  /** Bytes moved, resent pieces included; drives the speed. */
   bytes: number;
   files: number;
   problems: number;
   rate: number;
+  /** Bytes the job will send; null until its counting walk finishes. */
   total: number | null;
+  total_files: number | null;
+  /** Bytes of the job's files that have landed, resumed bytes included. */
+  done: number;
+  /** Seconds left, from the daemon's ten-second speed average. */
+  eta: number | null;
+  /** Files in flight (at most 16). */
+  active: FileProgress[];
 }
 
 export interface Snapshot {

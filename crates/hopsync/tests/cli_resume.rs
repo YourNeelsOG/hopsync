@@ -47,7 +47,7 @@ fn killed_push_resumes_on_the_next_run() {
     };
     let (pins, _known, target) = sshd.client();
     let journal = pins.path().join("journal.sqlite");
-    // Disk-backed, like a real transfer; 4 sequential chunks of 64 MiB on one lane.
+    // Disk-backed, like a real transfer; 16 sequential chunks of 16 MiB on one lane.
     let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("tempdir");
     let src = work.path().join("big.bin");
     {
@@ -76,7 +76,16 @@ fn killed_push_resumes_on_the_next_run() {
                 sshd.addr.ip(),
                 remote_dir.display()
             ))
-            .args(["-p", &sshd.addr.port().to_string(), "-l", "1", "-i"])
+            // A checkpoint per chunk, so the kill lands after some are recorded.
+            .args([
+                "-p",
+                &sshd.addr.port().to_string(),
+                "-l",
+                "1",
+                "--checkpoint",
+                "16M",
+                "-i",
+            ])
             .arg(sshd.client_key());
         c
     };
