@@ -87,14 +87,19 @@ fn write_source(path: &Path, seed: u8) -> Vec<u8> {
 }
 
 /// Runs the transfer until 60 % of the bytes are through, then drops it, as a killed process would.
-async fn interrupted<F, Fut>(base: TransferOptions, run: F)
+async fn interrupted<F, Fut>(e: &Env, base: TransferOptions, run: F)
 where
     F: FnOnce(TransferOptions) -> Fut,
     Fut: Future<Output = Result<FileReport, TransferError>>,
 {
     let done = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(tokio::sync::Notify::new());
+    let db = e._pins.path().join("journal.sqlite");
     let o = TransferOptions {
+        on_read: Some(support::hold_reads_until_checkpoint(
+            db.clone(),
+            (SIZE as u64) * 6 / 10,
+        )),
         progress: Some(Arc::new({
             let (done, stop) = (done.clone(), stop.clone());
             move |n| {
@@ -105,10 +110,17 @@ where
         })),
         ..base
     };
+    let mut run = Box::pin(run(o));
     tokio::select! {
-        r = run(o) => panic!("transfer finished before the interruption: {r:?}"),
+        r = &mut run => panic!("transfer finished before the interruption: {r:?}"),
         () = stop.notified() => {}
     }
+    // Interrupt only once some chunk is durable, so there is something to resume.
+    tokio::select! {
+        r = &mut run => panic!("transfer finished before a checkpoint: {r:?}"),
+        () = support::checkpoint_landed(&db) => {}
+    }
+    drop(run);
     tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
@@ -160,7 +172,7 @@ async fn verify_checks_every_byte_of_a_push_and_a_pull() {
 async fn verify_catches_a_damaged_part_on_push_resume() {
     let Some(e) = env() else { return };
     let data = write_source(&e.local_path("f"), 2);
-    interrupted(e.opts(false), |o| {
+    interrupted(&e, e.opts(false), |o| {
         let e = &e;
         async move { push_file(&e.local, &rel("f"), &e.remote, &rel("f"), &o).await }
     })
@@ -191,7 +203,7 @@ async fn verify_catches_a_damaged_part_on_push_resume() {
 async fn verify_catches_a_damaged_part_on_pull_resume() {
     let Some(e) = env() else { return };
     let data = write_source(&e.remote_path("f"), 3);
-    interrupted(e.opts(false), |o| {
+    interrupted(&e, e.opts(false), |o| {
         let e = &e;
         async move { pull_file(&e.remote, &rel("f"), &e.local, &rel("f"), &o).await }
     })

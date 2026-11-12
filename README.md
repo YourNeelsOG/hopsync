@@ -355,7 +355,7 @@ hopsync pull user@seedbox.example.com:downloads/Datasets ./
 | `--min-free 10G` | Refuse files that would leave less free space than this at the destination. |
 | `--cache keep` | Keep transferred data in the page cache. The default drops it. |
 | `--no-resume` | Do not record or use the resume journal. |
-| `--checkpoint 1G` | How much of a file is written between durability checkpoints. A crash redoes at most this much per file. `0` checkpoints every 16 MiB chunk. |
+| `--checkpoint 1G` | How much of a file is written between durability checkpoints. Transfers stay at most one checkpoint ahead of a flush, so a crash redoes at most about twice this much per file. `0` checkpoints every 16 MiB chunk. |
 | `--read-ahead 128M` | Memory for source data read ahead of the network. |
 | `--io-wait-target 40` | Slow down reading when the source disk takes longer than this many milliseconds per read. `0` turns it off. |
 
