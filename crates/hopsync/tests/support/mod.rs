@@ -311,3 +311,30 @@ pub fn speaks_ssh(mut stream: TcpStream) -> bool {
         && stream.read_exact(&mut banner).is_ok()
         && &banner == b"SSH-"
 }
+
+/// Chunks the resume journal at `db` holds as durable.
+fn recorded_chunks(db: &Path) -> i64 {
+    rusqlite::Connection::open(db)
+        .and_then(|c| c.query_row("SELECT count(*) FROM chunks", [], |r| r.get(0)))
+        .unwrap_or(0)
+}
+
+/// A push `on_read` hook that holds any source read reaching past `from` bytes until the journal
+/// at `db` records a durable chunk. Checkpoints run alongside the data, so without it a fast loopback push
+/// can pass an interruption point before its first fsync returns.
+pub fn hold_reads_until_checkpoint(db: PathBuf, from: u64) -> hopsync::engine::ReadFn {
+    std::sync::Arc::new(move |_: &str, offset: u64, len: usize| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while offset + len as u64 > from && recorded_chunks(&db) == 0 {
+            assert!(Instant::now() < deadline, "no checkpoint landed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })
+}
+
+/// Returns once the journal at `db` records a durable chunk.
+pub async fn checkpoint_landed(db: &Path) {
+    while recorded_chunks(db) == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}

@@ -85,15 +85,21 @@ fn write_source(path: &Path, seed: u8, mtime: u64) -> Vec<u8> {
     data
 }
 
-/// Runs the transfer until `fraction` of the bytes are through, then drops it.
-async fn interrupted<F, Fut>(fraction: f64, run: F)
+/// Runs the transfer until `fraction` of the bytes are through, then drops it. With `durable_in`,
+/// waits first for a checkpoint to land in that env's journal, so the run leaves something to
+/// resume; a push's reader is held at `fraction` meanwhile.
+async fn interrupted<F, Fut>(durable_in: Option<&Env>, fraction: f64, run: F)
 where
     F: FnOnce(TransferOptions) -> Fut,
     Fut: Future<Output = Result<FileReport, TransferError>>,
 {
     let done = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(tokio::sync::Notify::new());
+    let db = durable_in.map(|e| e._pins.path().join("journal.sqlite"));
     let o = TransferOptions {
+        on_read: db
+            .clone()
+            .map(|db| support::hold_reads_until_checkpoint(db, (SIZE as f64 * fraction) as u64)),
         progress: Some(Arc::new({
             let (done, stop) = (done.clone(), stop.clone());
             move |n| {
@@ -104,10 +110,18 @@ where
         })),
         ..TransferOptions::default()
     };
+    let mut run = Box::pin(run(o));
     tokio::select! {
-        r = run(o) => panic!("transfer finished before the interruption: {r:?}"),
+        r = &mut run => panic!("transfer finished before the interruption: {r:?}"),
         () = stop.notified() => {}
     }
+    if let Some(db) = &db {
+        tokio::select! {
+            r = &mut run => panic!("transfer finished before a checkpoint: {r:?}"),
+            () = support::checkpoint_landed(db) => {}
+        }
+    }
+    drop(run);
     // Let blocking writes that were already running land, as they would in a killed process.
     tokio::time::sleep(Duration::from_millis(200)).await;
 }
@@ -115,6 +129,7 @@ where
 fn with_journal(base: TransferOptions, o: TransferOptions) -> TransferOptions {
     TransferOptions {
         progress: o.progress,
+        on_read: o.on_read,
         ..base
     }
 }
@@ -123,7 +138,7 @@ fn with_journal(base: TransferOptions, o: TransferOptions) -> TransferOptions {
 async fn interrupted_push_resumes_missing_chunks_only() {
     let Some(e) = env() else { return };
     let data = write_source(&e.local_path("f"), 1, 1_600_000_000);
-    interrupted(0.6, |o| {
+    interrupted(Some(&e), 0.6, |o| {
         let (e, o) = (&e, with_journal(e.opts(), o));
         async move { push_file(&e.local, &rel("f"), &e.remote, &rel("f"), &o).await }
     })
@@ -157,7 +172,7 @@ async fn interrupted_push_resumes_missing_chunks_only() {
 async fn interrupted_pull_resumes_missing_chunks_only() {
     let Some(e) = env() else { return };
     let data = write_source(&e.remote_path("f"), 2, 1_600_000_000);
-    interrupted(0.6, |o| {
+    interrupted(Some(&e), 0.6, |o| {
         let (e, o) = (&e, with_journal(e.opts(), o));
         async move { pull_file(&e.remote, &rel("f"), &e.local, &rel("f"), &o).await }
     })
@@ -178,7 +193,7 @@ async fn interrupted_pull_resumes_missing_chunks_only() {
 async fn changed_source_between_runs_restarts_the_file() {
     let Some(e) = env() else { return };
     write_source(&e.local_path("f"), 3, 1_600_000_000);
-    interrupted(0.6, |o| {
+    interrupted(Some(&e), 0.6, |o| {
         let (e, o) = (&e, with_journal(e.opts(), o));
         async move { push_file(&e.local, &rel("f"), &e.remote, &rel("f"), &o).await }
     })
@@ -196,7 +211,7 @@ async fn changed_source_between_runs_restarts_the_file() {
 async fn lost_part_file_is_not_trusted() {
     let Some(e) = env() else { return };
     let data = write_source(&e.remote_path("f"), 5, 1_600_000_000);
-    interrupted(0.6, |o| {
+    interrupted(Some(&e), 0.6, |o| {
         let (e, o) = (&e, with_journal(e.opts(), o));
         async move { pull_file(&e.remote, &rel("f"), &e.local, &rel("f"), &o).await }
     })
@@ -224,7 +239,7 @@ async fn chunks_are_recorded_in_checkpoint_batches() {
         ..e.opts()
     };
     assert_eq!(base.checkpoint, 1 << 30, "default checkpoint");
-    interrupted(0.9, |o| {
+    interrupted(None, 0.9, |o| {
         let (e, o) = (&e, with_journal(base.clone(), o));
         async move { push_file(&e.local, &rel("f"), &e.remote, &rel("f"), &o).await }
     })
@@ -241,7 +256,7 @@ async fn chunks_are_recorded_in_checkpoint_batches() {
         ..e.opts()
     };
     let data = write_source(&e.local_path("g"), 5, 1_600_000_000);
-    interrupted(0.9, |o| {
+    interrupted(Some(&e), 0.9, |o| {
         let (e, o) = (&e, with_journal(two.clone(), o));
         async move { push_file(&e.local, &rel("g"), &e.remote, &rel("g"), &o).await }
     })
@@ -277,7 +292,7 @@ async fn a_pull_preallocates_its_part_file() {
         return;
     }
     write_source(&e.remote_path("f"), 6, 1_600_000_000);
-    interrupted(0.25, |o| {
+    interrupted(Some(&e), 0.25, |o| {
         let (e, o) = (&e, with_journal(e.opts(), o));
         async move { pull_file(&e.remote, &rel("f"), &e.local, &rel("f"), &o).await }
     })

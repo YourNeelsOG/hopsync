@@ -113,7 +113,10 @@ pub struct TransferOptions {
     /// transfer. Bounds a push's memory; a full budget pauses reading.
     pub read_ahead: u64,
     /// Bytes of a file written between durability checkpoints (one `fsync@` or `fsync`, then the
-    /// journal records the chunks). A crash redoes at most this much per file. 0: every chunk.
+    /// journal records the chunks). One checkpoint is in flight at a time: chunks written while
+    /// it flushes join the next one, and writers wait once this much more is written, so the
+    /// destination never holds much more than two checkpoints unflushed. A crash redoes at most
+    /// about twice this much per file. 0: every chunk.
     pub checkpoint: u64,
     /// Files at least this big read from a disk only when no other transfer in this process is
     /// reading such a file from the same disk (`disk_gate`). Smaller files are never held back.
@@ -907,8 +910,8 @@ struct FileState {
     check: OnceCell<Arc<LocalReader>>,
     /// Local side, opened by the first worker to need it and closed with the last reference.
     local: OnceCell<LocalSide>,
-    /// Chunks written since the last durability checkpoint, and their bytes (`record_durable`).
-    unsynced: Mutex<(Vec<u64>, u64)>,
+    /// Chunks written since the last durability checkpoint (`record_durable`).
+    unsynced: Mutex<Unsynced>,
     /// Bytes landed, for `on_file`; resumed bytes count from the start.
     done: AtomicU64,
 }
@@ -989,7 +992,7 @@ impl FileState {
             distrust: AtomicBool::new(false),
             check: OnceCell::new(),
             local: OnceCell::new(),
-            unsynced: Mutex::new((Vec::new(), 0)),
+            unsynced: Mutex::default(),
             done: AtomicU64::new(0),
         }
     }
@@ -1119,6 +1122,7 @@ struct Shared {
     /// A session of its own for push fsyncs (`sync_remote`), so a long flush blocks no lane:
     /// sftp-server answers one request at a time, so writes queued behind an fsync would wait too.
     sync: tokio::sync::Mutex<SyncSession>,
+    checkpoints: Checkpoints,
     /// One governor per source device; None where the device cannot be watched.
     governors: Mutex<HashMap<u64, Option<crate::governor::Governor>>>,
     /// Bytes moved, for auto-tune.
@@ -1705,6 +1709,7 @@ where
         generations: AtomicU64::new(1),
         connecting: Semaphore::new(CONNECTING),
         sync: tokio::sync::Mutex::new(SyncSession::Untried),
+        checkpoints: Checkpoints::default(),
         governors: Mutex::default(),
         moved: AtomicU64::new(0),
         pending: AtomicU64::new(0),
@@ -2270,6 +2275,10 @@ async fn transfer_with_retry(
             if item.resumed {
                 return verify_chunk(shared, side, &handle, &item.file, item.range, None).await;
             }
+            if shared.opts.journal.is_some() && item.file.journal_id.is_some() {
+                let limit = shared.opts.checkpoint.max(MIN_AHEAD);
+                shared.checkpoints.wait_for_room(limit).await;
+            }
             let hash = transfer_chunk(shared, side, &handle, item).await?;
             if shared.opts.verify {
                 verify_chunk(shared, side, &handle, &item.file, item.range, hash).await?;
@@ -2289,8 +2298,91 @@ async fn transfer_with_retry(
     }
 }
 
-/// Adds the chunk to its file's checkpoint batch. Once the batch holds `checkpoint` bytes, makes
-/// the file durable at the destination (one `fsync@` or `fsync` covers every chunk written before
+/// Bytes writers may send past a checkpoint in flight however small `checkpoint` is, so tiny
+/// checkpoints (tests use one per chunk) do not turn every write into a wait.
+const MIN_AHEAD: u64 = 64 << 20;
+
+/// Chunks of one file written since its last durability checkpoint, and their bytes.
+#[derive(Debug, Default)]
+struct Unsynced {
+    chunks: Vec<u64>,
+    bytes: u64,
+}
+
+/// The durability checkpoints of one transfer, at most one in flight. An fsync flushes everything
+/// the destination holds for the file, so where its disk is slower than the network one takes as
+/// long as the backlog: 5 to 30 s from NL10G to HDD5TB (2026-11-12). Queued behind one another,
+/// each waiting worker held its chunk's read-ahead buffer until the budget ran out and the push
+/// stopped. Now chunks written during a flush wait in their file's batch for the next one.
+///
+/// Writers may run one checkpoint ahead of a flush in flight, then wait for it (`wait_for_room`).
+/// Unbounded, a push from a 10 Gbit box filled the destination's page cache at network speed and
+/// then showed 0 B/s for a minute while it flushed before the rename (2026-11-12). Bounded, the
+/// destination holds at most about two checkpoints unflushed and the rate follows its disk.
+#[derive(Debug, Default)]
+struct Checkpoints {
+    in_flight: AtomicBool,
+    /// Bytes written since the flight in flight started.
+    ahead: AtomicU64,
+    landed: tokio::sync::Notify,
+}
+
+/// Ends the checkpoint flight when dropped, whether the fsync succeeded, failed, or was cancelled.
+struct Flight<'a>(&'a Checkpoints);
+
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.store(false, Ordering::Release);
+        self.0.landed.notify_waiters();
+    }
+}
+
+impl Checkpoints {
+    /// Adds a written chunk to its file's batch. Once the batch holds `every` bytes and no other
+    /// checkpoint is in flight, returns it with the flight to hold while making it durable.
+    fn add<'a>(
+        &'a self,
+        file: &Mutex<Unsynced>,
+        index: u64,
+        len: u64,
+        every: u64,
+    ) -> Option<(Vec<u64>, Flight<'a>)> {
+        let mut u = file.lock().ok()?;
+        u.chunks.push(index);
+        u.bytes += len;
+        self.ahead.fetch_add(len, Ordering::AcqRel);
+        if u.bytes < every
+            || self
+                .in_flight
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+        {
+            return None;
+        }
+        u.bytes = 0;
+        self.ahead.store(0, Ordering::Release);
+        Some((std::mem::take(&mut u.chunks), Flight(self)))
+    }
+
+    /// Returns once a writer may send more: no checkpoint is in flight, or fewer than `limit`
+    /// bytes were written since it started.
+    async fn wait_for_room(&self, limit: u64) {
+        loop {
+            let landed = self.landed.notified();
+            tokio::pin!(landed);
+            // Registered before the check, so a flight that ends in between still wakes us.
+            landed.as_mut().enable();
+            if !self.in_flight.load(Ordering::Acquire) || self.ahead.load(Ordering::Acquire) < limit
+            {
+                return;
+            }
+            landed.await;
+        }
+    }
+}
+
+/// Adds the chunk to its file's checkpoint batch. Once the batch holds `checkpoint` bytes and no
+/// other checkpoint is in flight (`Checkpoints`), makes the file durable at the destination (one `fsync@` or `fsync` covers every chunk written before
 /// it) and records the batch in the journal. A server without `fsync@` gets no records: its chunks
 /// are never claimed durable, so a resume redoes them. Chunks still in an unfinished batch when the
 /// file completes need no record: the journal row is dropped with the finished file.
@@ -2306,17 +2398,13 @@ async fn record_durable(
     if item.range.len == 0 {
         return Ok(());
     }
-    let batch = {
-        let Ok(mut u) = item.file.unsynced.lock() else {
-            return Ok(());
-        };
-        u.0.push(item.index);
-        u.1 += item.range.len;
-        if u.1 < shared.opts.checkpoint {
-            return Ok(());
-        }
-        u.1 = 0;
-        std::mem::take(&mut u.0)
+    let Some((batch, _flight)) = shared.checkpoints.add(
+        &item.file.unsynced,
+        item.index,
+        item.range.len,
+        shared.opts.checkpoint,
+    ) else {
+        return Ok(());
     };
     match side {
         LocalSide::Reader(_) => match shared.sync_remote(item.file.remote_path(), handle).await {
@@ -2808,5 +2896,72 @@ mod tests {
             pa,
             "deterministic for resume"
         );
+    }
+
+    #[test]
+    fn a_checkpoint_takes_the_chunks_written_since_the_last_one() {
+        let (checkpoints, file) = (Checkpoints::default(), Mutex::default());
+        for i in 0..3 {
+            assert!(checkpoints.add(&file, i, 10, 40).is_none(), "chunk {i}");
+        }
+        let (batch, _flight) = checkpoints.add(&file, 3, 10, 40).expect("40 bytes reached");
+        assert_eq!(batch, vec![0, 1, 2, 3]);
+        drop(_flight);
+        assert!(checkpoints.add(&file, 4, 10, 40).is_none(), "a fresh batch");
+    }
+
+    /// 2026-11-12, NL10G to HDD5TB: fsyncs that each flushed seconds of backlog queued up behind
+    /// one another, every waiter holding its chunk's read-ahead buffer, until the budget ran out
+    /// and the push sent nothing for 5 to 30 s at a time.
+    #[test]
+    fn a_checkpoint_never_queues_behind_one_in_flight() {
+        let checkpoints = Checkpoints::default();
+        let (a, b) = (Mutex::default(), Mutex::default());
+        let (first, flight) = checkpoints.add(&a, 0, 40, 40).expect("first checkpoint");
+        assert_eq!(first, vec![0]);
+        // Over the checkpoint size, on this file and another, while the first is still flushing.
+        assert!(checkpoints.add(&a, 1, 40, 40).is_none());
+        assert!(checkpoints.add(&b, 7, 40, 40).is_none());
+        assert!(checkpoints.add(&b, 8, 40, 40).is_none());
+        drop(flight);
+        // The next chunk starts one checkpoint that covers everything that waited.
+        let (batch, _flight) = checkpoints.add(&b, 9, 40, 40).expect("next checkpoint");
+        assert_eq!(batch, vec![7, 8, 9]);
+        let (batch, _) = {
+            drop(_flight);
+            checkpoints
+                .add(&a, 2, 1, 40)
+                .expect("file a's waiting chunks")
+        };
+        assert_eq!(batch, vec![1, 2]);
+    }
+
+    /// 2026-11-12, NL10G to HDD5TB: a 16 GiB push went out in 31 s, then showed 0 B/s for a minute
+    /// while the destination flushed the backlog to its disk before the rename.
+    #[tokio::test]
+    async fn writers_stay_one_checkpoint_ahead_of_the_destination_disk() {
+        let checkpoints = Arc::new(Checkpoints::default());
+        let file = Mutex::default();
+        // No checkpoint in flight: nothing waits.
+        checkpoints.wait_for_room(40).await;
+        let (_, flight) = checkpoints.add(&file, 0, 40, 40).expect("checkpoint");
+        assert!(checkpoints.add(&file, 1, 30, 40).is_none());
+        // 30 bytes past the flushing checkpoint, under the 40 allowed.
+        checkpoints.wait_for_room(40).await;
+        assert!(checkpoints.add(&file, 2, 10, 40).is_none());
+        let waiter = tokio::spawn({
+            let c = checkpoints.clone();
+            async move { c.wait_for_room(40).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiter.is_finished(),
+            "a full checkpoint ahead: writers wait"
+        );
+        drop(flight);
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the landed checkpoint frees the writers")
+            .expect("join");
     }
 }
