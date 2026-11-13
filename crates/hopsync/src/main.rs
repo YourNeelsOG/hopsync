@@ -298,7 +298,8 @@ struct TransferArgs {
     #[arg(long)]
     no_resume: bool,
     /// Bytes written per file between durability checkpoints (an fsync on the destination, then
-    /// the journal records them). A crash redoes at most this much per file.
+    /// the journal records them). Transfers stay at most one checkpoint ahead of a flush, so a
+    /// crash redoes at most about twice this much per file.
     #[arg(long, value_name = "SIZE", value_parser = parse_size, default_value = "1G")]
     checkpoint: u64,
     /// Pace a push's reads once the source disk's average read wait stays above this many

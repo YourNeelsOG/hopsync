@@ -4,7 +4,6 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -173,15 +172,29 @@ async fn a_cancel_stops_quickly_and_the_next_run_resumes() {
     let journal = Arc::new(Journal::open(&e.pins.path().join("journal.sqlite")).expect("journal"));
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let cancel_tx = Arc::new(cancel_tx);
-    let sent = Arc::new(AtomicU64::new(0));
     let cancelled_at = Arc::new(Mutex::new(None::<Instant>));
-    let progress = {
-        let (sent, cancel_tx, at) = (sent.clone(), cancel_tx.clone(), cancelled_at.clone());
-        Arc::new(move |n: u64| {
-            if sent.fetch_add(n, Ordering::Relaxed) + n > 40 << 20 && !*cancel_tx.borrow() {
-                *at.lock().expect("lock") = Some(Instant::now());
-                cancel_tx.send_replace(true);
+    // Cancels once the source is read past 40 MiB and a checkpoint has landed in the journal.
+    // Checkpoints run alongside the data, so the reader waits for one here: without that wait a
+    // fast local push can pass the cancel point before its first fsync returns.
+    let on_read = {
+        let (cancel_tx, at) = (cancel_tx.clone(), cancelled_at.clone());
+        let db = e.pins.path().join("journal.sqlite");
+        Arc::new(move |_: &str, offset: u64, _: usize| {
+            if offset < 40 << 20 || *cancel_tx.borrow() {
+                return;
             }
+            let conn = rusqlite::Connection::open(&db).expect("journal db");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while conn
+                .query_row("SELECT count(*) FROM chunks", [], |r| r.get::<_, i64>(0))
+                .expect("count")
+                == 0
+            {
+                assert!(Instant::now() < deadline, "no checkpoint landed");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            *at.lock().expect("lock") = Some(Instant::now());
+            cancel_tx.send_replace(true);
         })
     };
     let opts = TransferOptions {
@@ -196,7 +209,7 @@ async fn a_cancel_stops_quickly_and_the_next_run_resumes() {
         checkpoint: 8 << 20,
         journal: Some(journal.clone()),
         cancel: Some(cancel_rx),
-        progress: Some(progress),
+        on_read: Some(on_read),
         ..TransferOptions::default()
     };
     let err = push_file(&e.local, &rel("big"), &e.remote, &rel("big"), &opts)
@@ -220,7 +233,7 @@ async fn a_cancel_stops_quickly_and_the_next_run_resumes() {
 
     let again = TransferOptions {
         cancel: None,
-        progress: None,
+        on_read: None,
         ..opts
     };
     let report = push_file(&e.local, &rel("big"), &e.remote, &rel("big"), &again)
